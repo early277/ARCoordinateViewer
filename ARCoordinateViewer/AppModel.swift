@@ -50,7 +50,7 @@ final class AppModel: ObservableObject {
         return value
     }
     private let maxRasterCount = 1
-    private let settingsKey = "ARCoordinateViewer.DisplaySettings.v32"
+    private let settingsKey = "ARCoordinateViewer.DisplaySettings.v33"
     private struct ParsedImportResult {
         var name: String
         var features: [GeoFeature]

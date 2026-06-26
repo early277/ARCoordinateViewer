@@ -68,6 +68,7 @@ struct ARRendererView: UIViewRepresentable {
         private var lastRenderSignature: Int = 0
         private var textureCache: [UUID: TextureResource] = [:]
         private var requestedLiDAREnabled = false
+        private var defaultLiDARPreferenceApplied = false
         private var lastAppliedLiDAREnabled: Bool?
         private var isSessionActive = false
         private var currentLabels: [RenderLabel] = []
@@ -145,16 +146,34 @@ struct ARRendererView: UIViewRepresentable {
         }
 
         func setLiDARPreference(_ enabled: Bool, on arView: ARView) {
-            requestedLiDAREnabled = enabled
             let supported = ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh)
-            Task { @MainActor in
-                self.model?.lidarSupported = supported
+            var effectiveEnabled = enabled
+
+            if !defaultLiDARPreferenceApplied {
+                defaultLiDARPreferenceApplied = true
+                if supported && !enabled {
+                    effectiveEnabled = true
+                    Task { @MainActor in
+                        self.model?.lidarEnabled = true
+                        self.model?.lidarSupported = supported
+                    }
+                } else {
+                    Task { @MainActor in
+                        self.model?.lidarSupported = supported
+                    }
+                }
+            } else {
+                Task { @MainActor in
+                    self.model?.lidarSupported = supported
+                }
             }
 
+            requestedLiDAREnabled = effectiveEnabled
+
             guard isSessionActive else { return }
-            guard lastAppliedLiDAREnabled != enabled else { return }
-            lastAppliedLiDAREnabled = enabled
-            if enabled && !supported {
+            guard lastAppliedLiDAREnabled != effectiveEnabled else { return }
+            lastAppliedLiDAREnabled = effectiveEnabled
+            if effectiveEnabled && !supported {
                 setARStatus("LiDAR非対応端末です")
                 return
             }
