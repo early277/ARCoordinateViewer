@@ -398,16 +398,54 @@ final class AppModel: ObservableObject {
     }
 
     func setPlanePanFromScreenDrag(startEast: Double, startNorth: Double, translation: CGSize, metersPerPoint: Double) {
-        let localEast = Double(translation.width) * metersPerPoint
-        let localNorth = -Double(translation.height) * metersPerPoint
+        let screenEast = Double(translation.width) * metersPerPoint
+        let screenNorth = -Double(translation.height) * metersPerPoint
+
+        // 水平移動パッドは画面上の前後左右を直接動かす。
+        // 方位変更時の回転中心は setHeadingOffsetPreservingCurrentCenter で保つ。
+        planePanEastMeters = startEast + screenEast
+        planePanNorthMeters = startNorth + screenNorth
+    }
+
+    func setHeadingOffsetPreservingCurrentCenter(_ nextDegrees: Double) {
+        let delta = (nextDegrees - headingOffsetDegrees) * .pi / 180.0
+        let cosA = cos(delta)
+        let sinA = sin(delta)
+        let east = planePanEastMeters
+        let north = planePanNorthMeters
+
+        // 現在画面中心に来ている地物が、方位変更中も同じ画面中心に残るよう、
+        // パン量を方位差分だけ同時に回転させる。
+        planePanEastMeters = east * cosA - north * sinA
+        planePanNorthMeters = east * sinA + north * cosA
+        headingOffsetDegrees = nextDegrees
+    }
+
+    func updateOriginToCurrentPanCenter() {
+        guard let origin else { return }
+        let centerOffset = currentPanCenterOffsetMeters()
+        guard abs(centerOffset.east) > 0.0001 || abs(centerOffset.north) > 0.0001 else {
+            statusMessage = "中心位置は更新済みです"
+            return
+        }
+
+        self.origin = CoordinateConverter.coordinate(
+            fromEast: centerOffset.east,
+            north: centerOffset.north,
+            origin: origin,
+            name: "中心更新"
+        )
+        resetPlanePan()
+        statusMessage = "現在の表示中心を現在地に反映しました"
+    }
+
+    private func currentPanCenterOffsetMeters() -> (east: Double, north: Double) {
         let angle = headingOffsetDegrees * .pi / 180.0
         let cosA = cos(angle)
         let sinA = sin(angle)
-
-        // 水平移動パッドの入力は画面上の見た目の向きに合わせる。
-        // ルートEntity自体を方位補正で回転しているため、パン量も同じ角度でワールド座標へ変換する。
-        planePanEastMeters = startEast + localEast * cosA - localNorth * sinA
-        planePanNorthMeters = startNorth + localEast * sinA + localNorth * cosA
+        let unrotatedEast = planePanEastMeters * cosA + planePanNorthMeters * sinA
+        let unrotatedNorth = -planePanEastMeters * sinA + planePanNorthMeters * cosA
+        return (east: -unrotatedEast, north: -unrotatedNorth)
     }
 
     func selectPointForAR(_ point: GeoCoordinate) {
@@ -423,7 +461,7 @@ final class AppModel: ObservableObject {
     }
 
     func resetHeadingOffset() {
-        headingOffsetDegrees = 0
+        setHeadingOffsetPreservingCurrentCenter(0)
     }
 
     func resetDisplaySettings() {
@@ -584,6 +622,8 @@ final class AppModel: ObservableObject {
         return [
             makeDisplayLimitCacheSignature(),
             "origin=\(originText)",
+            "pan=\(planePanEastMeters.rounded(toPlaces: 3)),\(planePanNorthMeters.rounded(toPlaces: 3))",
+            "heading=\(headingOffsetDegrees.rounded(toPlaces: 3))",
             "sel=\(selectedPoint?.id.uuidString ?? "no-selected")",
             "alt=\(settings.useRelativeAltitude)-\(settings.relativeAltitudeLimitMeters)",
             "labels=\(settings.showLabels)-\(settings.maxLabelCount)-\(settings.labelDistanceMeters)",
@@ -1113,7 +1153,14 @@ final class AppModel: ObservableObject {
     }
 
     private func horizontalDistance(_ position: SIMD3<Float>) -> Float {
-        simd_length(SIMD2<Float>(position.x, position.z))
+        let angle = headingOffsetDegrees * .pi / 180.0
+        let cosA = Float(cos(angle))
+        let sinA = Float(sin(angle))
+        let east = position.x
+        let north = -position.z
+        let displayedEast = east * cosA - north * sinA + Float(planePanEastMeters)
+        let displayedNorth = east * sinA + north * cosA + Float(planePanNorthMeters)
+        return simd_length(SIMD2<Float>(displayedEast, displayedNorth))
     }
 
     private func saveSettings() {
