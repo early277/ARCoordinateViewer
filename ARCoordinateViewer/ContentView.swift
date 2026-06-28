@@ -355,12 +355,12 @@ struct ContentView: View {
     }
 
     private var horizontalMovePad: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            HStack(spacing: 6) {
-                Label("水平移動", systemImage: "move.3d")
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 5) {
+                Label("水平", systemImage: "move.3d")
                     .font(.caption2.weight(.bold))
-                Spacer(minLength: 4)
-                Button(horizontalPadFineMode ? "微調整" : "大移動") {
+                Spacer(minLength: 2)
+                Button(horizontalPadFineMode ? "微" : "大") {
                     horizontalPadFineMode.toggle()
                     model.statusMessage = horizontalPadFineMode ? "水平移動：微調整モード" : "水平移動：大移動モード"
                 }
@@ -371,44 +371,54 @@ struct ContentView: View {
 
             ZStack {
                 Circle()
-                    .fill(.black.opacity(0.26))
-                    .overlay(Circle().stroke(.white.opacity(0.72), lineWidth: 1))
-                    .frame(width: 104, height: 104)
+                    .fill(.black.opacity(0.14))
+                    .overlay(Circle().stroke(.white.opacity(0.5), lineWidth: 1))
+                    .frame(width: 82, height: 82)
 
                 Image(systemName: "arrow.up.and.down.and.arrow.left.and.right")
-                    .font(.title3.weight(.semibold))
-                    .foregroundStyle(.white.opacity(0.9))
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.white.opacity(0.78))
 
                 Circle()
-                    .fill(horizontalPadFineMode ? Color.cyan.opacity(0.82) : Color.orange.opacity(0.86))
-                    .overlay(Circle().stroke(.white.opacity(0.9), lineWidth: 1))
-                    .frame(width: 38, height: 38)
+                    .fill(horizontalPadFineMode ? Color.cyan.opacity(0.68) : Color.orange.opacity(0.72))
+                    .overlay(Circle().stroke(.white.opacity(0.78), lineWidth: 1))
+                    .frame(width: 30, height: 30)
                     .offset(clampedHorizontalPadOffset)
-                    .shadow(radius: 3)
+                    .shadow(radius: 2)
             }
+            .frame(maxWidth: .infinity)
             .gesture(horizontalPadGesture)
 
-            HStack(spacing: 8) {
-                Text(horizontalPadFineMode ? "1pt=1cm" : "1pt=8cm")
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.secondary)
-                Spacer()
+            Text(horizontalPadFineMode ? "1pt=1cm" : "1pt=8cm")
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.white.opacity(0.78))
+
+            HStack(spacing: 5) {
+                Button("中心更新") {
+                    model.centerSelectedPointInAR()
+                }
+                .disabled(model.selectedPoint == nil)
+
                 Button("リセット") {
                     model.resetHorizontalPan()
                     model.statusMessage = "水平移動をリセットしました"
                 }
-                .font(.caption2.weight(.semibold))
-                .buttonStyle(.bordered)
-                .controlSize(.mini)
             }
+            .font(.caption2.weight(.semibold))
+            .buttonStyle(.bordered)
+            .controlSize(.mini)
         }
-        .frame(width: 128)
-        .padding(9)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
+        .frame(width: 116)
+        .padding(6)
+        .background(.black.opacity(0.14), in: RoundedRectangle(cornerRadius: 13))
+        .overlay(
+            RoundedRectangle(cornerRadius: 13)
+                .stroke(.white.opacity(0.18), lineWidth: 1)
+        )
     }
 
     private var clampedHorizontalPadOffset: CGSize {
-        let maxRadius: CGFloat = 33
+        let maxRadius: CGFloat = 26
         let length = hypot(horizontalPadDragOffset.width, horizontalPadDragOffset.height)
         guard length > maxRadius else { return horizontalPadDragOffset }
         let scale = maxRadius / length
