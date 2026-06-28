@@ -43,8 +43,11 @@ struct ARRendererView: UIViewRepresentable {
 
         // 画面ドラッグによる方位・高さ補正は、全Entityの再生成ではなくルートEntityの変換で処理する。
         // これにより、ドラッグ中の描画負荷を抑える。
-        root.position = SIMD3<Float>(Float(model.planePanEastMeters), Float(model.displayPlaneOffsetMeters), Float(-model.planePanNorthMeters))
-        root.orientation = simd_quatf(angle: Float(model.headingOffsetDegrees * .pi / 180.0), axis: SIMD3<Float>(0, 1, 0))
+        let rootOrientation = simd_quatf(angle: Float(model.headingOffsetDegrees * .pi / 180.0), axis: SIMD3<Float>(0, 1, 0))
+        let localPan = SIMD3<Float>(Float(model.planePanEastMeters), 0, Float(-model.planePanNorthMeters))
+        let rotatedPan = rootOrientation.act(localPan)
+        root.position = SIMD3<Float>(rotatedPan.x, Float(model.displayPlaneOffsetMeters), rotatedPan.z)
+        root.orientation = rootOrientation
 
         context.coordinator.render(
             features: model.renderFeatures,
@@ -68,6 +71,7 @@ struct ARRendererView: UIViewRepresentable {
         private var lastRenderSignature: Int = 0
         private var textureCache: [UUID: TextureResource] = [:]
         private var requestedLiDAREnabled = false
+        private var defaultLiDARPreferenceApplied = false
         private var lastAppliedLiDAREnabled: Bool?
         private var isSessionActive = false
         private var currentLabels: [RenderLabel] = []
@@ -145,16 +149,34 @@ struct ARRendererView: UIViewRepresentable {
         }
 
         func setLiDARPreference(_ enabled: Bool, on arView: ARView) {
-            requestedLiDAREnabled = enabled
             let supported = ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh)
-            Task { @MainActor in
-                self.model?.lidarSupported = supported
+            var effectiveEnabled = enabled
+
+            if !defaultLiDARPreferenceApplied {
+                defaultLiDARPreferenceApplied = true
+                if supported && !enabled {
+                    effectiveEnabled = true
+                    Task { @MainActor in
+                        self.model?.lidarEnabled = true
+                        self.model?.lidarSupported = supported
+                    }
+                } else {
+                    Task { @MainActor in
+                        self.model?.lidarSupported = supported
+                    }
+                }
+            } else {
+                Task { @MainActor in
+                    self.model?.lidarSupported = supported
+                }
             }
 
+            requestedLiDAREnabled = effectiveEnabled
+
             guard isSessionActive else { return }
-            guard lastAppliedLiDAREnabled != enabled else { return }
-            lastAppliedLiDAREnabled = enabled
-            if enabled && !supported {
+            guard lastAppliedLiDAREnabled != effectiveEnabled else { return }
+            lastAppliedLiDAREnabled = effectiveEnabled
+            if effectiveEnabled && !supported {
                 setARStatus("LiDAR非対応端末です")
                 return
             }
