@@ -13,8 +13,6 @@ final class AppModel: ObservableObject {
     @Published var displayPlaneOffsetMeters: Double = -1.0
     @Published var planePanEastMeters: Double = 0
     @Published var planePanNorthMeters: Double = 0
-    @Published var headingRotationCenterEastMeters: Double = 0
-    @Published var headingRotationCenterNorthMeters: Double = 0
     @Published var pillarsEnabled: Bool = false
     @Published var rastersEnabled: Bool = true
     @Published var distancesEnabled: Bool = false
@@ -394,8 +392,6 @@ final class AppModel: ObservableObject {
         displayPlaneOffsetMeters = -1.0
         planePanEastMeters = 0
         planePanNorthMeters = 0
-        headingRotationCenterEastMeters = 0
-        headingRotationCenterNorthMeters = 0
         distancesEnabled = false
     }
 
@@ -403,19 +399,35 @@ final class AppModel: ObservableObject {
         headingOffsetDegrees = 0
     }
 
-    func setHeadingRotationCenterToCurrentPan() {
-        let rotation = simd_quatd(angle: headingOffsetDegrees * .pi / 180.0, axis: SIMD3<Double>(0, 1, 0))
-        let oldCenter = SIMD3<Double>(headingRotationCenterEastMeters, 0, -headingRotationCenterNorthMeters)
-        let currentPan = SIMD3<Double>(planePanEastMeters, 0, -planePanNorthMeters)
-        let currentTranslation = currentPan + oldCenter - rotation.act(oldCenter)
-        let newCenter = currentPan
-        let adjustedPan = currentTranslation - newCenter + rotation.act(newCenter)
+    func applyHorizontalPanToOrigin() {
+        guard let currentOrigin = origin else {
+            statusMessage = "現在地が未設定です"
+            return
+        }
 
-        headingRotationCenterEastMeters = newCenter.x
-        headingRotationCenterNorthMeters = -newCenter.z
-        planePanEastMeters = adjustedPan.x
-        planePanNorthMeters = -adjustedPan.z
-        statusMessage = "方位の回転中心を現在の水平移動位置に設定しました"
+        guard abs(planePanEastMeters) >= 0.001 || abs(planePanNorthMeters) >= 0.001 else {
+            statusMessage = "水平移動の差分はありません"
+            return
+        }
+
+        // 表示側に加えていた水平移動量を、現在地座標へ焼き込む。
+        // 同じ見え方を保つには、現在地は表示オフセットと逆向きに移動する。
+        let adjusted = CoordinateConverter.coordinate(
+            fromEast: -planePanEastMeters,
+            north: -planePanNorthMeters,
+            origin: currentOrigin,
+            name: currentOrigin.name ?? "補正現在地"
+        )
+
+        origin = GeoCoordinate(
+            name: adjusted.name,
+            latitude: adjusted.latitude,
+            longitude: adjusted.longitude,
+            altitude: currentOrigin.altitude
+        )
+        planePanEastMeters = 0
+        planePanNorthMeters = 0
+        statusMessage = "水平移動後の位置を現在地に反映しました"
     }
 
     func resetDisplaySettings() {

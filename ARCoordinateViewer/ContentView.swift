@@ -388,25 +388,13 @@ struct ContentView: View {
             .frame(maxWidth: .infinity)
             .gesture(horizontalPadGesture)
 
-            HStack(spacing: 4) {
-                Button("中心") {
-                    model.setHeadingRotationCenterToCurrentPan()
-                }
-                .font(.caption2.weight(.semibold))
-                .buttonStyle(.bordered)
-                .controlSize(.mini)
-
-                Button("戻す") {
-                    model.planePanEastMeters = 0
-                    model.planePanNorthMeters = 0
-                    model.headingRotationCenterEastMeters = 0
-                    model.headingRotationCenterNorthMeters = 0
-                    model.statusMessage = "水平移動をリセットしました"
-                }
-                .font(.caption2.weight(.semibold))
-                .buttonStyle(.bordered)
-                .controlSize(.mini)
+            Button("現在地化") {
+                model.applyHorizontalPanToOrigin()
             }
+            .font(.caption2.weight(.semibold))
+            .buttonStyle(.bordered)
+            .controlSize(.mini)
+            .frame(maxWidth: .infinity)
         }
         .frame(width: 92)
         .padding(6)

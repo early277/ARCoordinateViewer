@@ -43,12 +43,8 @@ struct ARRendererView: UIViewRepresentable {
 
         // 画面ドラッグによる方位・高さ補正は、全Entityの再生成ではなくルートEntityの変換で処理する。
         // これにより、ドラッグ中の描画負荷を抑える。
-        let headingRotation = simd_quatf(angle: Float(model.headingOffsetDegrees * .pi / 180.0), axis: SIMD3<Float>(0, 1, 0))
-        let headingCenter = SIMD3<Float>(Float(model.headingRotationCenterEastMeters), 0, Float(-model.headingRotationCenterNorthMeters))
-        let panOffset = SIMD3<Float>(Float(model.planePanEastMeters), Float(model.displayPlaneOffsetMeters), Float(-model.planePanNorthMeters))
-        let centeredRotationOffset = headingCenter - headingRotation.act(headingCenter)
-        root.position = panOffset + centeredRotationOffset
-        root.orientation = headingRotation
+        root.position = SIMD3<Float>(Float(model.planePanEastMeters), Float(model.displayPlaneOffsetMeters), Float(-model.planePanNorthMeters))
+        root.orientation = simd_quatf(angle: Float(model.headingOffsetDegrees * .pi / 180.0), axis: SIMD3<Float>(0, 1, 0))
 
         context.coordinator.render(
             features: model.renderFeatures,
