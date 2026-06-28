@@ -393,8 +393,7 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
                 Spacer()
                 Button("リセット") {
-                    model.planePanEastMeters = 0
-                    model.planePanNorthMeters = 0
+                    model.resetPlanePan()
                     model.statusMessage = "水平移動をリセットしました"
                 }
                 .font(.caption2.weight(.semibold))
@@ -425,8 +424,12 @@ struct ContentView: View {
                 }
                 horizontalPadDragOffset = value.translation
                 let metersPerPoint = horizontalPadFineMode ? 0.01 : 0.08
-                model.planePanEastMeters = horizontalPadDragStartEastMeters + Double(value.translation.width) * metersPerPoint
-                model.planePanNorthMeters = horizontalPadDragStartNorthMeters - Double(value.translation.height) * metersPerPoint
+                model.setPlanePanFromScreenDrag(
+                    startEast: horizontalPadDragStartEastMeters,
+                    startNorth: horizontalPadDragStartNorthMeters,
+                    translation: value.translation,
+                    metersPerPoint: metersPerPoint
+                )
             }
             .onEnded { _ in
                 model.statusMessage = "水平移動：東西 \(model.planePanEastMeters.formatted(.number.precision(.fractionLength(2))))m / 南北 \(model.planePanNorthMeters.formatted(.number.precision(.fractionLength(2))))m"
