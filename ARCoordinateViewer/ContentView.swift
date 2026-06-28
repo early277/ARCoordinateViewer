@@ -67,7 +67,7 @@ struct ContentView: View {
                 HStack(alignment: .bottom) {
                     horizontalMovePad
                         .padding(.leading, 12)
-                        .padding(.bottom, 58)
+                        .padding(.bottom, 52)
                     Spacer()
                 }
             }
@@ -354,12 +354,12 @@ struct ContentView: View {
     }
 
     private var horizontalMovePad: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            HStack(spacing: 6) {
-                Label("水平移動", systemImage: "move.3d")
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 4) {
+                Label("水平", systemImage: "move.3d")
                     .font(.caption2.weight(.bold))
-                Spacer(minLength: 4)
-                Button(horizontalPadFineMode ? "微調整" : "大移動") {
+                Spacer(minLength: 2)
+                Button(horizontalPadFineMode ? "微" : "大") {
                     horizontalPadFineMode.toggle()
                     model.statusMessage = horizontalPadFineMode ? "水平移動：微調整モード" : "水平移動：大移動モード"
                 }
@@ -370,31 +370,37 @@ struct ContentView: View {
 
             ZStack {
                 Circle()
-                    .fill(.black.opacity(0.26))
-                    .overlay(Circle().stroke(.white.opacity(0.72), lineWidth: 1))
-                    .frame(width: 104, height: 104)
+                    .fill(.black.opacity(0.10))
+                    .overlay(Circle().stroke(.white.opacity(0.54), lineWidth: 1))
+                    .frame(width: 74, height: 74)
 
                 Image(systemName: "arrow.up.and.down.and.arrow.left.and.right")
-                    .font(.title3.weight(.semibold))
-                    .foregroundStyle(.white.opacity(0.9))
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.white.opacity(0.78))
 
                 Circle()
-                    .fill(horizontalPadFineMode ? Color.cyan.opacity(0.82) : Color.orange.opacity(0.86))
-                    .overlay(Circle().stroke(.white.opacity(0.9), lineWidth: 1))
-                    .frame(width: 38, height: 38)
+                    .fill(horizontalPadFineMode ? Color.cyan.opacity(0.58) : Color.orange.opacity(0.62))
+                    .overlay(Circle().stroke(.white.opacity(0.72), lineWidth: 1))
+                    .frame(width: 28, height: 28)
                     .offset(clampedHorizontalPadOffset)
-                    .shadow(radius: 3)
+                    .shadow(radius: 2)
             }
+            .frame(maxWidth: .infinity)
             .gesture(horizontalPadGesture)
 
-            HStack(spacing: 8) {
-                Text(horizontalPadFineMode ? "1pt=1cm" : "1pt=8cm")
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button("リセット") {
+            HStack(spacing: 4) {
+                Button("中心") {
+                    model.setHeadingRotationCenterToCurrentPan()
+                }
+                .font(.caption2.weight(.semibold))
+                .buttonStyle(.bordered)
+                .controlSize(.mini)
+
+                Button("戻す") {
                     model.planePanEastMeters = 0
                     model.planePanNorthMeters = 0
+                    model.headingRotationCenterEastMeters = 0
+                    model.headingRotationCenterNorthMeters = 0
                     model.statusMessage = "水平移動をリセットしました"
                 }
                 .font(.caption2.weight(.semibold))
@@ -402,13 +408,13 @@ struct ContentView: View {
                 .controlSize(.mini)
             }
         }
-        .frame(width: 128)
-        .padding(9)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
+        .frame(width: 92)
+        .padding(6)
+        .background(.black.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
     }
 
     private var clampedHorizontalPadOffset: CGSize {
-        let maxRadius: CGFloat = 33
+        let maxRadius: CGFloat = 23
         let length = hypot(horizontalPadDragOffset.width, horizontalPadDragOffset.height)
         guard length > maxRadius else { return horizontalPadDragOffset }
         let scale = maxRadius / length
@@ -1184,6 +1190,7 @@ struct DisplaySettingsSheet: View {
     private var detailedSettings: some View {
         Section("詳細：AR表示サイズ") {
             sliderRow(title: "点の大きさ", value: $model.settings.arPointSize, range: 0.03...1.0, step: 0.01, unit: "m")
+            sliderRow(title: "画面上の最小点サイズ", value: $model.settings.arPointScreenDiameterPixels, range: 0...80, step: 1, unit: "px")
             sliderRow(title: "選択点の球体", value: $model.settings.arSelectedSphereSize, range: 0.05...1.5, step: 0.01, unit: "m")
             sliderRow(title: "ラインの太さ", value: $model.settings.arLineWidth, range: 0.005...0.3, step: 0.005, unit: "m")
         }

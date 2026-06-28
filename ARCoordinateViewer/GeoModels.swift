@@ -202,15 +202,16 @@ struct DisplaySettings: Codable, Equatable {
     var displayRadiusMeters: Double = 0
     var labelDistanceMeters: Double = 150
 
-    var arPointSize: Double = 0.036
-    var arSelectedSphereSize: Double = 0.068
+    var arPointSize: Double = 0.10
+    var arPointScreenDiameterPixels: Double = 28
+    var arSelectedSphereSize: Double = 0.12
     var arLineWidth: Double = 0.01
 
     var planPointSize: Double = 7
     var planLineWidth: Double = 2
 
     var farMinimumSizeEnabled: Bool = true
-    var farPointMinSize: Double = 0.096
+    var farPointMinSize: Double = 0.10
     var farLineMinWidth: Double = 0.008
 
     /// 取り込んだ標高を、現在地付近の標高を基準にした高さ差としてAR表示する。
@@ -231,6 +232,7 @@ struct DisplaySettings: Codable, Equatable {
         displayRadiusMeters = Swift.max(0, Swift.min(displayRadiusMeters, 10000))
         labelDistanceMeters = Swift.max(0, Swift.min(labelDistanceMeters, 10000))
         arPointSize = Swift.max(0.03, Swift.min(arPointSize, 2.0))
+        arPointScreenDiameterPixels = Swift.max(0, Swift.min(arPointScreenDiameterPixels, 120))
         arSelectedSphereSize = Swift.max(0.05, Swift.min(arSelectedSphereSize, 3.0))
         arLineWidth = Swift.max(0.005, Swift.min(arLineWidth, 1.0))
         planPointSize = Swift.max(2, Swift.min(planPointSize, 40))
@@ -245,6 +247,7 @@ struct DisplaySettings: Codable, Equatable {
 struct RenderStyle: Hashable {
     var pointRadius: Float
     var selectedPointRadius: Float
+    var pointScreenDiameterPixels: Float
     var lineRadius: Float
     var farMinimumSizeEnabled: Bool
     var farPointMinRadius: Float

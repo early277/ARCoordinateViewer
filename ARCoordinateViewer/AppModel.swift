@@ -13,6 +13,8 @@ final class AppModel: ObservableObject {
     @Published var displayPlaneOffsetMeters: Double = -1.0
     @Published var planePanEastMeters: Double = 0
     @Published var planePanNorthMeters: Double = 0
+    @Published var headingRotationCenterEastMeters: Double = 0
+    @Published var headingRotationCenterNorthMeters: Double = 0
     @Published var pillarsEnabled: Bool = false
     @Published var rastersEnabled: Bool = true
     @Published var distancesEnabled: Bool = false
@@ -50,7 +52,7 @@ final class AppModel: ObservableObject {
         return value
     }
     private let maxRasterCount = 1
-    private let settingsKey = "ARCoordinateViewer.DisplaySettings.v33"
+    private let settingsKey = "ARCoordinateViewer.DisplaySettings.v34"
     private struct ParsedImportResult {
         var name: String
         var features: [GeoFeature]
@@ -392,11 +394,28 @@ final class AppModel: ObservableObject {
         displayPlaneOffsetMeters = -1.0
         planePanEastMeters = 0
         planePanNorthMeters = 0
+        headingRotationCenterEastMeters = 0
+        headingRotationCenterNorthMeters = 0
         distancesEnabled = false
     }
 
     func resetHeadingOffset() {
         headingOffsetDegrees = 0
+    }
+
+    func setHeadingRotationCenterToCurrentPan() {
+        let rotation = simd_quatd(angle: headingOffsetDegrees * .pi / 180.0, axis: SIMD3<Double>(0, 1, 0))
+        let oldCenter = SIMD3<Double>(headingRotationCenterEastMeters, 0, -headingRotationCenterNorthMeters)
+        let currentPan = SIMD3<Double>(planePanEastMeters, 0, -planePanNorthMeters)
+        let currentTranslation = currentPan + oldCenter - rotation.act(oldCenter)
+        let newCenter = currentPan
+        let adjustedPan = currentTranslation - newCenter + rotation.act(newCenter)
+
+        headingRotationCenterEastMeters = newCenter.x
+        headingRotationCenterNorthMeters = -newCenter.z
+        planePanEastMeters = adjustedPan.x
+        planePanNorthMeters = -adjustedPan.z
+        statusMessage = "方位の回転中心を現在の水平移動位置に設定しました"
     }
 
     func resetDisplaySettings() {
@@ -514,6 +533,7 @@ final class AppModel: ObservableObject {
         RenderStyle(
             pointRadius: Float(settings.arPointSize),
             selectedPointRadius: Float(settings.arSelectedSphereSize),
+            pointScreenDiameterPixels: Float(settings.arPointScreenDiameterPixels),
             lineRadius: Float(settings.arLineWidth),
             farMinimumSizeEnabled: settings.farMinimumSizeEnabled,
             farPointMinRadius: Float(settings.farPointMinSize),

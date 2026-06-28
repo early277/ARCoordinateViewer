@@ -43,8 +43,12 @@ struct ARRendererView: UIViewRepresentable {
 
         // 画面ドラッグによる方位・高さ補正は、全Entityの再生成ではなくルートEntityの変換で処理する。
         // これにより、ドラッグ中の描画負荷を抑える。
-        root.position = SIMD3<Float>(Float(model.planePanEastMeters), Float(model.displayPlaneOffsetMeters), Float(-model.planePanNorthMeters))
-        root.orientation = simd_quatf(angle: Float(model.headingOffsetDegrees * .pi / 180.0), axis: SIMD3<Float>(0, 1, 0))
+        let headingRotation = simd_quatf(angle: Float(model.headingOffsetDegrees * .pi / 180.0), axis: SIMD3<Float>(0, 1, 0))
+        let headingCenter = SIMD3<Float>(Float(model.headingRotationCenterEastMeters), 0, Float(-model.headingRotationCenterNorthMeters))
+        let panOffset = SIMD3<Float>(Float(model.planePanEastMeters), Float(model.displayPlaneOffsetMeters), Float(-model.planePanNorthMeters))
+        let centeredRotationOffset = headingCenter - headingRotation.act(headingCenter)
+        root.position = panOffset + centeredRotationOffset
+        root.orientation = headingRotation
 
         context.coordinator.render(
             features: model.renderFeatures,
@@ -266,6 +270,7 @@ struct ARRendererView: UIViewRepresentable {
             hasher.combine(labels.count)
             hasher.combine(Int((style.pointRadius * 10000).rounded()))
             hasher.combine(Int((style.selectedPointRadius * 10000).rounded()))
+            hasher.combine(Int(style.pointScreenDiameterPixels.rounded()))
             hasher.combine(Int((style.lineRadius * 10000).rounded()))
             hasher.combine(style.farMinimumSizeEnabled)
             hasher.combine(Int((style.farPointMinRadius * 10000).rounded()))
@@ -398,10 +403,34 @@ struct ARRendererView: UIViewRepresentable {
 
 
         private func effectivePointRadius(at position: SIMD3<Float>, style: RenderStyle) -> Float {
-            guard style.farMinimumSizeEnabled else { return style.pointRadius }
+            let physicalRadius = style.farMinimumSizeEnabled ? farScaledPointRadius(at: position, style: style) : style.pointRadius
+            return max(physicalRadius, screenSpacePointRadius(at: position, style: style))
+        }
+
+        private func farScaledPointRadius(at position: SIMD3<Float>, style: RenderStyle) -> Float {
             let d = simd_length(SIMD2<Float>(position.x, position.z))
             let scale = min(max(d / 35.0, 1.0), 4.0)
             return max(style.pointRadius, style.farPointMinRadius * scale)
+        }
+
+        private func screenSpacePointRadius(at position: SIMD3<Float>, style: RenderStyle) -> Float {
+            guard style.pointScreenDiameterPixels > 0, let arView else { return 0 }
+            let worldPosition = rootAnchor?.convert(position: position, to: nil) ?? position
+            let cameraMatrix = arView.cameraTransform.matrix
+            let cameraPosition = SIMD3<Float>(
+                cameraMatrix.columns.3.x,
+                cameraMatrix.columns.3.y,
+                cameraMatrix.columns.3.z
+            )
+            let distance = max(simd_length(worldPosition - cameraPosition), 0.05)
+            let pixelRadius = style.pointScreenDiameterPixels / 2
+
+            if let fy = arView.session.currentFrame?.camera.intrinsics.columns.1.y, fy > 0 {
+                return max(0, distance * pixelRadius / fy)
+            }
+
+            let fallbackFocalPixels = max(Float(arView.bounds.height), 1)
+            return max(0, distance * pixelRadius / fallbackFocalPixels)
         }
 
         private func effectiveLineRadius(from start: SIMD3<Float>, to end: SIMD3<Float>, style: RenderStyle) -> Float {
