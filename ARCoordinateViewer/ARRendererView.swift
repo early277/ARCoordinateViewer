@@ -269,6 +269,7 @@ struct ARRendererView: UIViewRepresentable {
             hasher.combine(labels.count)
             hasher.combine(Int((style.pointRadius * 10000).rounded()))
             hasher.combine(Int((style.selectedPointRadius * 10000).rounded()))
+            hasher.combine(Int((style.pointScreenDiameterPixels * 100).rounded()))
             hasher.combine(Int((style.lineRadius * 10000).rounded()))
             hasher.combine(style.farMinimumSizeEnabled)
             hasher.combine(Int((style.farPointMinRadius * 10000).rounded()))

@@ -245,6 +245,7 @@ struct DisplaySettings: Codable, Equatable {
 struct RenderStyle: Hashable {
     var pointRadius: Float
     var selectedPointRadius: Float
+    var pointScreenDiameterPixels: Float
     var lineRadius: Float
     var farMinimumSizeEnabled: Bool
     var farPointMinRadius: Float

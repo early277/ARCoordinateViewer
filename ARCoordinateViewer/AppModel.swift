@@ -555,6 +555,7 @@ final class AppModel: ObservableObject {
         RenderStyle(
             pointRadius: Float(settings.arPointSize),
             selectedPointRadius: Float(settings.arSelectedSphereSize),
+            pointScreenDiameterPixels: Float(settings.planPointSize),
             lineRadius: Float(settings.arLineWidth),
             farMinimumSizeEnabled: settings.farMinimumSizeEnabled,
             farPointMinRadius: Float(settings.farPointMinSize),
