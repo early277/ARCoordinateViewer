@@ -889,6 +889,15 @@ struct PlanMapSheet: View {
                         }
                         dismiss()
                     }
+                    .buttonStyle(.bordered)
+                    .disabled((draftSelectedPoint ?? model.selectedPoint) == nil)
+
+                    Button("AR中心へ") {
+                        if let p = draftSelectedPoint ?? model.selectedPoint {
+                            model.selectPointForAR(p, centerInView: true)
+                        }
+                        dismiss()
+                    }
                     .buttonStyle(.borderedProminent)
                     .disabled((draftSelectedPoint ?? model.selectedPoint) == nil)
                 }

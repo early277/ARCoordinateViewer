@@ -386,9 +386,42 @@ final class AppModel: ObservableObject {
         statusMessage = "現在地を選択点に設定：\(point.name ?? "名称なし")"
     }
 
-    func selectPointForAR(_ point: GeoCoordinate) {
+    func selectPointForAR(_ point: GeoCoordinate, centerInView: Bool = false) {
         selectedPoint = point
-        statusMessage = "AR強調点：\(point.name ?? "名称なし")"
+
+        if centerInView {
+            if centerPointInAR(point) {
+                statusMessage = "AR中心へ移動：\(point.name ?? "名称なし")"
+            }
+        } else {
+            statusMessage = "AR強調点：\(point.name ?? "名称なし")"
+        }
+    }
+
+    func centerSelectedPointInAR() {
+        guard let selectedPoint else {
+            statusMessage = "中心移動する点が選択されていません"
+            return
+        }
+        if centerPointInAR(selectedPoint) {
+            statusMessage = "AR中心へ移動：\(selectedPoint.name ?? "名称なし")"
+        }
+    }
+
+    @discardableResult
+    private func centerPointInAR(_ point: GeoCoordinate) -> Bool {
+        guard let origin else {
+            statusMessage = "現在地を設定してから中心移動してください"
+            return false
+        }
+
+        let enu = CoordinateConverter.enuMeters(from: point, origin: origin)
+        // Render entities are kept in unrotated ENU space and the AR root entity applies heading.
+        // Therefore the pan needed to bring a point to the screen/world center is the negative
+        // of the point's local ENU position, regardless of the current heading angle.
+        planePanEastMeters = -enu.east
+        planePanNorthMeters = -enu.north
+        return true
     }
 
     func resetScreenAdjustments() {
