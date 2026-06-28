@@ -388,7 +388,7 @@ struct ContentView: View {
             .frame(maxWidth: .infinity)
             .gesture(horizontalPadGesture)
 
-            Button("現在地化") {
+            Button("中心更新") {
                 model.applyHorizontalPanToOrigin()
             }
             .font(.caption2.weight(.semibold))
