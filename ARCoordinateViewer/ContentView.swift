@@ -200,7 +200,7 @@ struct ContentView: View {
                 switch axis {
                 case .heading:
                     let sensitivityDegreesPerPoint = 0.18
-                    model.setHeadingOffsetPreservingCurrentCenter(dragStartHeadingDegrees - Double(value.translation.width) * sensitivityDegreesPerPoint)
+                    model.headingOffsetDegrees = dragStartHeadingDegrees - Double(value.translation.width) * sensitivityDegreesPerPoint
                 case .height:
                     let sensitivityMetersPerPoint = 0.012
                     let next = dragStartPlaneOffsetMeters - Double(value.translation.height) * sensitivityMetersPerPoint

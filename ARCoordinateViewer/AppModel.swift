@@ -401,24 +401,10 @@ final class AppModel: ObservableObject {
         let screenEast = Double(translation.width) * metersPerPoint
         let screenNorth = -Double(translation.height) * metersPerPoint
 
-        // 水平移動パッドは画面上の前後左右を直接動かす。
-        // 方位変更時の回転中心は setHeadingOffsetPreservingCurrentCenter で保つ。
+        // 水平移動中は原点・ラベル距離・回転中心を更新せず、
+        // 見た目の一時的な平行移動だけを軽量に反映する。
         planePanEastMeters = startEast + screenEast
         planePanNorthMeters = startNorth + screenNorth
-    }
-
-    func setHeadingOffsetPreservingCurrentCenter(_ nextDegrees: Double) {
-        let delta = (nextDegrees - headingOffsetDegrees) * .pi / 180.0
-        let cosA = cos(delta)
-        let sinA = sin(delta)
-        let east = planePanEastMeters
-        let north = planePanNorthMeters
-
-        // 現在画面中心に来ている地物が、方位変更中も同じ画面中心に残るよう、
-        // パン量を方位差分だけ同時に回転させる。
-        planePanEastMeters = east * cosA - north * sinA
-        planePanNorthMeters = east * sinA + north * cosA
-        headingOffsetDegrees = nextDegrees
     }
 
     func updateOriginToCurrentPanCenter() {
@@ -461,7 +447,7 @@ final class AppModel: ObservableObject {
     }
 
     func resetHeadingOffset() {
-        setHeadingOffsetPreservingCurrentCenter(0)
+        headingOffsetDegrees = 0
     }
 
     func resetDisplaySettings() {
@@ -622,8 +608,6 @@ final class AppModel: ObservableObject {
         return [
             makeDisplayLimitCacheSignature(),
             "origin=\(originText)",
-            "pan=\(planePanEastMeters.rounded(toPlaces: 3)),\(planePanNorthMeters.rounded(toPlaces: 3))",
-            "heading=\(headingOffsetDegrees.rounded(toPlaces: 3))",
             "sel=\(selectedPoint?.id.uuidString ?? "no-selected")",
             "alt=\(settings.useRelativeAltitude)-\(settings.relativeAltitudeLimitMeters)",
             "labels=\(settings.showLabels)-\(settings.maxLabelCount)-\(settings.labelDistanceMeters)",
@@ -1153,14 +1137,7 @@ final class AppModel: ObservableObject {
     }
 
     private func horizontalDistance(_ position: SIMD3<Float>) -> Float {
-        let angle = headingOffsetDegrees * .pi / 180.0
-        let cosA = Float(cos(angle))
-        let sinA = Float(sin(angle))
-        let east = position.x
-        let north = -position.z
-        let displayedEast = east * cosA - north * sinA + Float(planePanEastMeters)
-        let displayedNorth = east * sinA + north * cosA + Float(planePanNorthMeters)
-        return simd_length(SIMD2<Float>(displayedEast, displayedNorth))
+        simd_length(SIMD2<Float>(position.x, position.z))
     }
 
     private func saveSettings() {
