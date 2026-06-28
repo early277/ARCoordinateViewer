@@ -50,7 +50,7 @@ final class AppModel: ObservableObject {
         return value
     }
     private let maxRasterCount = 1
-    private let settingsKey = "ARCoordinateViewer.DisplaySettings.v32"
+    private let settingsKey = "ARCoordinateViewer.DisplaySettings.v34"
     private struct ParsedImportResult {
         var name: String
         var features: [GeoFeature]
@@ -352,13 +352,32 @@ final class AppModel: ObservableObject {
     }
 
     func setOriginFromLocation(_ location: CLLocation) {
-        origin = GeoCoordinate(
+        let nextOrigin = GeoCoordinate(
             name: "iOS現在地",
             latitude: location.coordinate.latitude,
             longitude: location.coordinate.longitude,
             altitude: nil
         )
+        preserveARPositionWhileChangingOrigin(to: nextOrigin)
         statusMessage = "現在地を更新：\(location.coordinate.latitude.formatted(.number.precision(.fractionLength(7)))), \(location.coordinate.longitude.formatted(.number.precision(.fractionLength(7))))"
+    }
+
+    private func preserveARPositionWhileChangingOrigin(to nextOrigin: GeoCoordinate) {
+        guard let currentOrigin = origin else {
+            origin = nextOrigin
+            return
+        }
+
+        let delta = CoordinateConverter.enuMeters(from: nextOrigin, origin: currentOrigin)
+        let angle = headingOffsetDegrees * .pi / 180.0
+        let cosA = cos(angle)
+        let sinA = sin(angle)
+
+        // AR表示全体には headingOffsetDegrees の回転がかかっているため、
+        // 現在地更新で発生する原点差分も同じ方位補正後の座標系でパン量へ反映する。
+        planePanEastMeters += delta.east * cosA - delta.north * sinA
+        planePanNorthMeters += delta.east * sinA + delta.north * cosA
+        origin = nextOrigin
     }
 
     func setOrigin(latitude: Double, longitude: Double) {

@@ -202,16 +202,16 @@ struct DisplaySettings: Codable, Equatable {
     var displayRadiusMeters: Double = 0
     var labelDistanceMeters: Double = 150
 
-    var arPointSize: Double = 0.036
-    var arSelectedSphereSize: Double = 0.068
+    var arPointSize: Double = 0.05
+    var arSelectedSphereSize: Double = 0.12
     var arLineWidth: Double = 0.01
 
-    var planPointSize: Double = 7
-    var planLineWidth: Double = 2
+    var planPointSize: Double = 3
+    var planLineWidth: Double = 1.5
 
-    var farMinimumSizeEnabled: Bool = true
-    var farPointMinSize: Double = 0.032
-    var farLineMinWidth: Double = 0.008
+    var farMinimumSizeEnabled: Bool = false
+    var farPointMinSize: Double = 0.10
+    var farLineMinWidth: Double = 0.01
 
     /// 取り込んだ標高を、現在地付近の標高を基準にした高さ差としてAR表示する。
     /// 標高0や欠損高度は軽量な近傍推定で補完する。
@@ -220,7 +220,7 @@ struct DisplaySettings: Codable, Equatable {
     var relativeAltitudeLimitMeters: Double = 100
 
     /// GeoTIFF全体の不透明度。1.0=不透明、0.0=透明。
-    var rasterOpacity: Double = 0.35
+    var rasterOpacity: Double = 0.5
 
     static let defaults = DisplaySettings()
 
