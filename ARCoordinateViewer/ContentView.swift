@@ -364,10 +364,12 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
                 .controlSize(.mini)
 
-                Button("中心") {
+                Button("中心を更新") {
                     model.updateOriginToCurrentPanCenter()
                 }
                 .font(.caption2.weight(.bold))
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
                 .buttonStyle(.bordered)
                 .controlSize(.mini)
             }
