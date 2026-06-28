@@ -50,7 +50,7 @@ final class AppModel: ObservableObject {
         return value
     }
     private let maxRasterCount = 1
-    private let settingsKey = "ARCoordinateViewer.DisplaySettings.v32"
+    private let settingsKey = "ARCoordinateViewer.DisplaySettings.v33"
     private struct ParsedImportResult {
         var name: String
         var features: [GeoFeature]
@@ -352,6 +352,7 @@ final class AppModel: ObservableObject {
     }
 
     func setOriginFromLocation(_ location: CLLocation) {
+        resetHorizontalPan()
         origin = GeoCoordinate(
             name: "iOS現在地",
             latitude: location.coordinate.latitude,
@@ -362,6 +363,7 @@ final class AppModel: ObservableObject {
     }
 
     func setOrigin(latitude: Double, longitude: Double) {
+        resetHorizontalPan()
         origin = GeoCoordinate(name: "手入力", latitude: latitude, longitude: longitude, altitude: nil)
         statusMessage = "現在地を手入力で設定"
     }
@@ -369,6 +371,7 @@ final class AppModel: ObservableObject {
     func setOriginFromPlane(system: Int, x: Double, y: Double) {
         do {
             let geo = try JapanesePlaneRectangularSystem.toGeodetic(system: system, x: x, y: y)
+            resetHorizontalPan()
             origin = GeoCoordinate(name: "平面直角\(system)系", latitude: geo.latitude, longitude: geo.longitude, altitude: nil)
             planeSystemNumber = system
             statusMessage = "現在地を平面直角座標で設定：\(system)系"
@@ -378,6 +381,7 @@ final class AppModel: ObservableObject {
     }
 
     func setOriginFromPoint(_ point: GeoCoordinate) {
+        resetHorizontalPan()
         origin = GeoCoordinate(name: point.name ?? "CSV選択点", latitude: point.latitude, longitude: point.longitude, altitude: nil)
         statusMessage = "現在地を選択点に設定：\(point.name ?? "名称なし")"
     }
@@ -390,9 +394,13 @@ final class AppModel: ObservableObject {
     func resetScreenAdjustments() {
         headingOffsetDegrees = 0
         displayPlaneOffsetMeters = -1.0
+        resetHorizontalPan()
+        distancesEnabled = false
+    }
+
+    func resetHorizontalPan() {
         planePanEastMeters = 0
         planePanNorthMeters = 0
-        distancesEnabled = false
     }
 
     func resetHeadingOffset() {

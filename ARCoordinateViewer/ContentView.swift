@@ -1,6 +1,7 @@
 import SwiftUI
 import UniformTypeIdentifiers
 import AVFoundation
+import simd
 
 private enum ARAdjustmentAxis {
     case heading
@@ -30,6 +31,11 @@ struct ContentView: View {
     @State private var adjustmentAxis: ARAdjustmentAxis?
     @State private var dragStartHeadingDegrees: Double = 0
     @State private var dragStartPlaneOffsetMeters: Double = -1.0
+    @State private var horizontalPadFineMode = true
+    @State private var horizontalPadDragStartEastMeters: Double = 0
+    @State private var horizontalPadDragStartNorthMeters: Double = 0
+    @State private var horizontalPadDragOffset: CGSize = .zero
+    @State private var horizontalPadIsDragging = false
 
     private var supportedImportTypes: [UTType] {
         [
@@ -56,6 +62,16 @@ struct ContentView: View {
                 .gesture(arAdjustmentGesture)
 
             screenLabelsOverlay
+
+            VStack {
+                Spacer()
+                HStack(alignment: .bottom) {
+                    horizontalMovePad
+                        .padding(.leading, 12)
+                        .padding(.bottom, 58)
+                    Spacer()
+                }
+            }
 
             VStack(spacing: 0) {
                 miniTopHUD
@@ -335,7 +351,95 @@ struct ContentView: View {
         if model.selectedPoint == nil && !model.importedPointList.isEmpty {
             return "次の操作：平面図で確認し、目標点をタップしてARへ適用できます。"
         }
-        return "AR表示中：横スワイプで方位、縦スワイプで高さを調整できます。平面図で点を選び直せます。"
+        return "AR表示中：左下パッドで水平移動、横スワイプで方位、縦スワイプで高さを調整できます。"
+    }
+
+    private var horizontalMovePad: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 6) {
+                Label("水平移動", systemImage: "move.3d")
+                    .font(.caption2.weight(.bold))
+                Spacer(minLength: 4)
+                Button(horizontalPadFineMode ? "微調整" : "大移動") {
+                    horizontalPadFineMode.toggle()
+                    model.statusMessage = horizontalPadFineMode ? "水平移動：微調整モード" : "水平移動：大移動モード"
+                }
+                .font(.caption2.weight(.bold))
+                .buttonStyle(.borderedProminent)
+                .controlSize(.mini)
+            }
+
+            ZStack {
+                Circle()
+                    .fill(.black.opacity(0.26))
+                    .overlay(Circle().stroke(.white.opacity(0.72), lineWidth: 1))
+                    .frame(width: 104, height: 104)
+
+                Image(systemName: "arrow.up.and.down.and.arrow.left.and.right")
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(.white.opacity(0.9))
+
+                Circle()
+                    .fill(horizontalPadFineMode ? Color.cyan.opacity(0.82) : Color.orange.opacity(0.86))
+                    .overlay(Circle().stroke(.white.opacity(0.9), lineWidth: 1))
+                    .frame(width: 38, height: 38)
+                    .offset(clampedHorizontalPadOffset)
+                    .shadow(radius: 3)
+            }
+            .gesture(horizontalPadGesture)
+
+            HStack(spacing: 8) {
+                Text(horizontalPadFineMode ? "1pt=1cm" : "1pt=8cm")
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("リセット") {
+                    model.resetHorizontalPan()
+                    model.statusMessage = "水平移動をリセットしました"
+                }
+                .font(.caption2.weight(.semibold))
+                .buttonStyle(.bordered)
+                .controlSize(.mini)
+            }
+        }
+        .frame(width: 128)
+        .padding(9)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
+    }
+
+    private var clampedHorizontalPadOffset: CGSize {
+        let maxRadius: CGFloat = 33
+        let length = hypot(horizontalPadDragOffset.width, horizontalPadDragOffset.height)
+        guard length > maxRadius else { return horizontalPadDragOffset }
+        let scale = maxRadius / length
+        return CGSize(width: horizontalPadDragOffset.width * scale, height: horizontalPadDragOffset.height * scale)
+    }
+
+    private var horizontalPadGesture: some Gesture {
+        DragGesture(minimumDistance: 0, coordinateSpace: .local)
+            .onChanged { value in
+                if !horizontalPadIsDragging {
+                    horizontalPadIsDragging = true
+                    horizontalPadDragStartEastMeters = model.planePanEastMeters
+                    horizontalPadDragStartNorthMeters = model.planePanNorthMeters
+                }
+                horizontalPadDragOffset = value.translation
+                let metersPerPoint = horizontalPadFineMode ? 0.01 : 0.08
+                let worldDelta = SIMD3<Float>(
+                    Float(Double(value.translation.width) * metersPerPoint),
+                    0,
+                    Float(Double(value.translation.height) * metersPerPoint)
+                )
+                let heading = simd_quatf(angle: Float(model.headingOffsetDegrees * .pi / 180.0), axis: SIMD3<Float>(0, 1, 0))
+                let localDelta = heading.inverse.act(worldDelta)
+                model.planePanEastMeters = horizontalPadDragStartEastMeters + Double(localDelta.x)
+                model.planePanNorthMeters = horizontalPadDragStartNorthMeters - Double(localDelta.z)
+            }
+            .onEnded { _ in
+                model.statusMessage = "水平移動：東西 \(model.planePanEastMeters.formatted(.number.precision(.fractionLength(2))))m / 南北 \(model.planePanNorthMeters.formatted(.number.precision(.fractionLength(2))))m"
+                horizontalPadDragOffset = .zero
+                horizontalPadIsDragging = false
+            }
     }
 
     private var compactBottomBar: some View {

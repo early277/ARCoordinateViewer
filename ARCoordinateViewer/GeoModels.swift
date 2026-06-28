@@ -210,7 +210,7 @@ struct DisplaySettings: Codable, Equatable {
     var planLineWidth: Double = 2
 
     var farMinimumSizeEnabled: Bool = true
-    var farPointMinSize: Double = 0.032
+    var farPointMinSize: Double = 0.096
     var farLineMinWidth: Double = 0.008
 
     /// 取り込んだ標高を、現在地付近の標高を基準にした高さ差としてAR表示する。
