@@ -354,47 +354,51 @@ struct ContentView: View {
     }
 
     private var horizontalMovePad: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            HStack(spacing: 6) {
-                Label("水平移動", systemImage: "move.3d")
-                    .font(.caption2.weight(.bold))
-                Spacer(minLength: 4)
-                Button(horizontalPadFineMode ? "微調整" : "大移動") {
+        VStack(alignment: .center, spacing: 5) {
+            HStack(spacing: 4) {
+                Button(horizontalPadFineMode ? "微" : "大") {
                     horizontalPadFineMode.toggle()
                     model.statusMessage = horizontalPadFineMode ? "水平移動：微調整モード" : "水平移動：大移動モード"
                 }
                 .font(.caption2.weight(.bold))
                 .buttonStyle(.borderedProminent)
                 .controlSize(.mini)
+
+                Button("中心を更新") {
+                    model.updateOriginToCurrentPanCenter()
+                }
+                .font(.caption2.weight(.bold))
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
+                .buttonStyle(.bordered)
+                .controlSize(.mini)
             }
 
             ZStack {
                 Circle()
-                    .fill(.black.opacity(0.26))
-                    .overlay(Circle().stroke(.white.opacity(0.72), lineWidth: 1))
-                    .frame(width: 104, height: 104)
+                    .fill(.black.opacity(0.10))
+                    .overlay(Circle().stroke(.white.opacity(0.55), lineWidth: 1))
+                    .frame(width: 82, height: 82)
 
                 Image(systemName: "arrow.up.and.down.and.arrow.left.and.right")
-                    .font(.title3.weight(.semibold))
-                    .foregroundStyle(.white.opacity(0.9))
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.white.opacity(0.82))
 
                 Circle()
-                    .fill(horizontalPadFineMode ? Color.cyan.opacity(0.82) : Color.orange.opacity(0.86))
-                    .overlay(Circle().stroke(.white.opacity(0.9), lineWidth: 1))
-                    .frame(width: 38, height: 38)
+                    .fill(horizontalPadFineMode ? Color.cyan.opacity(0.72) : Color.orange.opacity(0.76))
+                    .overlay(Circle().stroke(.white.opacity(0.8), lineWidth: 1))
+                    .frame(width: 28, height: 28)
                     .offset(clampedHorizontalPadOffset)
-                    .shadow(radius: 3)
+                    .shadow(radius: 2)
             }
             .gesture(horizontalPadGesture)
 
-            HStack(spacing: 8) {
-                Text(horizontalPadFineMode ? "1pt=1cm" : "1pt=8cm")
+            HStack(spacing: 4) {
+                Text(horizontalPadFineMode ? "1cm" : "8cm")
                     .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button("リセット") {
-                    model.planePanEastMeters = 0
-                    model.planePanNorthMeters = 0
+                    .foregroundStyle(.white.opacity(0.82))
+                Button("0") {
+                    model.resetPlanePan()
                     model.statusMessage = "水平移動をリセットしました"
                 }
                 .font(.caption2.weight(.semibold))
@@ -402,13 +406,13 @@ struct ContentView: View {
                 .controlSize(.mini)
             }
         }
-        .frame(width: 128)
-        .padding(9)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
+        .frame(width: 96)
+        .padding(6)
+        .background(Color.clear, in: RoundedRectangle(cornerRadius: 12))
     }
 
     private var clampedHorizontalPadOffset: CGSize {
-        let maxRadius: CGFloat = 33
+        let maxRadius: CGFloat = 27
         let length = hypot(horizontalPadDragOffset.width, horizontalPadDragOffset.height)
         guard length > maxRadius else { return horizontalPadDragOffset }
         let scale = maxRadius / length
@@ -425,8 +429,12 @@ struct ContentView: View {
                 }
                 horizontalPadDragOffset = value.translation
                 let metersPerPoint = horizontalPadFineMode ? 0.01 : 0.08
-                model.planePanEastMeters = horizontalPadDragStartEastMeters + Double(value.translation.width) * metersPerPoint
-                model.planePanNorthMeters = horizontalPadDragStartNorthMeters - Double(value.translation.height) * metersPerPoint
+                model.setPlanePanFromScreenDrag(
+                    startEast: horizontalPadDragStartEastMeters,
+                    startNorth: horizontalPadDragStartNorthMeters,
+                    translation: value.translation,
+                    metersPerPoint: metersPerPoint
+                )
             }
             .onEnded { _ in
                 model.statusMessage = "水平移動：東西 \(model.planePanEastMeters.formatted(.number.precision(.fractionLength(2))))m / 南北 \(model.planePanNorthMeters.formatted(.number.precision(.fractionLength(2))))m"

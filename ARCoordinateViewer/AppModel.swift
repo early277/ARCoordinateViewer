@@ -1,5 +1,6 @@
 import Foundation
 import CoreLocation
+import CoreGraphics
 import simd
 
 @MainActor
@@ -352,43 +353,38 @@ final class AppModel: ObservableObject {
     }
 
     func setOriginFromLocation(_ location: CLLocation) {
-        let nextOrigin = GeoCoordinate(
-            name: "iOS現在地",
-            latitude: location.coordinate.latitude,
-            longitude: location.coordinate.longitude,
-            altitude: nil
+        setOriginAndResetPlanePan(
+            GeoCoordinate(
+                name: "iOS現在地",
+                latitude: location.coordinate.latitude,
+                longitude: location.coordinate.longitude,
+                altitude: nil
+            )
         )
-        preserveARPositionWhileChangingOrigin(to: nextOrigin)
         statusMessage = "現在地を更新：\(location.coordinate.latitude.formatted(.number.precision(.fractionLength(7)))), \(location.coordinate.longitude.formatted(.number.precision(.fractionLength(7))))"
     }
 
-    private func preserveARPositionWhileChangingOrigin(to nextOrigin: GeoCoordinate) {
-        guard let currentOrigin = origin else {
-            origin = nextOrigin
-            return
-        }
-
-        let delta = CoordinateConverter.enuMeters(from: nextOrigin, origin: currentOrigin)
-        let angle = headingOffsetDegrees * .pi / 180.0
-        let cosA = cos(angle)
-        let sinA = sin(angle)
-
-        // AR表示全体には headingOffsetDegrees の回転がかかっているため、
-        // 現在地更新で発生する原点差分も同じ方位補正後の座標系でパン量へ反映する。
-        planePanEastMeters += delta.east * cosA - delta.north * sinA
-        planePanNorthMeters += delta.east * sinA + delta.north * cosA
+    /// 現在位置をユーザー操作・GPSで明示的に更新した場合、
+    /// 旧原点に対する水平移動補正を新原点へ持ち越さない。
+    private func setOriginAndResetPlanePan(_ nextOrigin: GeoCoordinate) {
         origin = nextOrigin
+        resetPlanePan()
+    }
+
+    func resetPlanePan() {
+        planePanEastMeters = 0
+        planePanNorthMeters = 0
     }
 
     func setOrigin(latitude: Double, longitude: Double) {
-        origin = GeoCoordinate(name: "手入力", latitude: latitude, longitude: longitude, altitude: nil)
+        setOriginAndResetPlanePan(GeoCoordinate(name: "手入力", latitude: latitude, longitude: longitude, altitude: nil))
         statusMessage = "現在地を手入力で設定"
     }
 
     func setOriginFromPlane(system: Int, x: Double, y: Double) {
         do {
             let geo = try JapanesePlaneRectangularSystem.toGeodetic(system: system, x: x, y: y)
-            origin = GeoCoordinate(name: "平面直角\(system)系", latitude: geo.latitude, longitude: geo.longitude, altitude: nil)
+            setOriginAndResetPlanePan(GeoCoordinate(name: "平面直角\(system)系", latitude: geo.latitude, longitude: geo.longitude, altitude: nil))
             planeSystemNumber = system
             statusMessage = "現在地を平面直角座標で設定：\(system)系"
         } catch {
@@ -397,8 +393,45 @@ final class AppModel: ObservableObject {
     }
 
     func setOriginFromPoint(_ point: GeoCoordinate) {
-        origin = GeoCoordinate(name: point.name ?? "CSV選択点", latitude: point.latitude, longitude: point.longitude, altitude: nil)
+        setOriginAndResetPlanePan(GeoCoordinate(name: point.name ?? "CSV選択点", latitude: point.latitude, longitude: point.longitude, altitude: nil))
         statusMessage = "現在地を選択点に設定：\(point.name ?? "名称なし")"
+    }
+
+    func setPlanePanFromScreenDrag(startEast: Double, startNorth: Double, translation: CGSize, metersPerPoint: Double) {
+        let screenEast = Double(translation.width) * metersPerPoint
+        let screenNorth = -Double(translation.height) * metersPerPoint
+
+        // 水平移動中は原点・ラベル距離・回転中心を更新せず、
+        // 見た目の一時的な平行移動だけを軽量に反映する。
+        planePanEastMeters = startEast + screenEast
+        planePanNorthMeters = startNorth + screenNorth
+    }
+
+    func updateOriginToCurrentPanCenter() {
+        guard let origin else { return }
+        let centerOffset = currentPanCenterOffsetMeters()
+        guard abs(centerOffset.east) > 0.0001 || abs(centerOffset.north) > 0.0001 else {
+            statusMessage = "中心位置は更新済みです"
+            return
+        }
+
+        self.origin = CoordinateConverter.coordinate(
+            fromEast: centerOffset.east,
+            north: centerOffset.north,
+            origin: origin,
+            name: "中心更新"
+        )
+        resetPlanePan()
+        statusMessage = "現在の表示中心を現在地に反映しました"
+    }
+
+    private func currentPanCenterOffsetMeters() -> (east: Double, north: Double) {
+        let angle = headingOffsetDegrees * .pi / 180.0
+        let cosA = cos(angle)
+        let sinA = sin(angle)
+        let unrotatedEast = planePanEastMeters * cosA + planePanNorthMeters * sinA
+        let unrotatedNorth = -planePanEastMeters * sinA + planePanNorthMeters * cosA
+        return (east: -unrotatedEast, north: -unrotatedNorth)
     }
 
     func selectPointForAR(_ point: GeoCoordinate) {
@@ -409,8 +442,7 @@ final class AppModel: ObservableObject {
     func resetScreenAdjustments() {
         headingOffsetDegrees = 0
         displayPlaneOffsetMeters = -1.0
-        planePanEastMeters = 0
-        planePanNorthMeters = 0
+        resetPlanePan()
         distancesEnabled = false
     }
 
