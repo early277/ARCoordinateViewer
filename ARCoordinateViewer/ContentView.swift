@@ -1,15 +1,25 @@
 import SwiftUI
 import UniformTypeIdentifiers
 import AVFoundation
+import ReplayKit
+import UIKit
 
 private enum ARAdjustmentAxis {
     case heading
     case height
 }
 
+private enum MainWorkspace: Hashable {
+    case ar
+    case map
+    case data
+}
+
 struct ContentView: View {
     @EnvironmentObject private var model: AppModel
     @EnvironmentObject private var locationManager: LocationManager
+    @Environment(\.openURL) private var openURL
+    @Environment(\.scenePhase) private var scenePhase
 
     @State private var showImporter = false
     @State private var showLatLonInput = false
@@ -19,6 +29,8 @@ struct ContentView: View {
     @State private var showSettings = false
     @State private var showLayerManager = false
     @State private var showHelp = false
+    @State private var showAlignment = false
+    @State private var showStatusDetails = false
     @State private var showCoordinateMenu = false
     @State private var showGeoTIFFCoordinateSheet = false
     @State private var showCSVImportSheet = false
@@ -33,8 +45,21 @@ struct ContentView: View {
     @State private var horizontalPadFineMode = true
     @State private var horizontalPadDragStartEastMeters: Double = 0
     @State private var horizontalPadDragStartNorthMeters: Double = 0
+    @State private var horizontalPadDragBasis: HorizontalScreenBasis?
+    @State private var horizontalPadDragHeadingDegrees: Double = 0
     @State private var horizontalPadDragOffset: CGSize = .zero
     @State private var horizontalPadIsDragging = false
+    @AppStorage("ARCoordinateViewer.HorizontalMovePadVisible")
+    private var horizontalMovePadVisible = true
+    @State private var presentationUIHidden = false
+    @State private var recordingUIHidden = false
+    @State private var recordingStarting = false
+    @State private var isRecording = false
+    @State private var replayPreview: ReplayPreviewItem?
+    @State private var selectedWorkspace: MainWorkspace = .ar
+    @State private var photoFlashVisible = false
+    @State private var photoFailureMessage: String?
+    @State private var captureFeedbackTrigger = 0
 
     private var supportedImportTypes: [UTType] {
         [
@@ -44,6 +69,7 @@ struct ContentView: View {
             UTType(filenameExtension: "sima") ?? .plainText,
             UTType(filenameExtension: "tif") ?? .tiff,
             UTType(filenameExtension: "tiff") ?? .tiff,
+            UTType(filenameExtension: "zip") ?? .data,
             .commaSeparatedText,
             .plainText,
             .text,
@@ -54,40 +80,42 @@ struct ContentView: View {
     }
 
     var body: some View {
-        ZStack {
-            ARRendererView()
-                .ignoresSafeArea()
-                .contentShape(Rectangle())
-                .gesture(arAdjustmentGesture)
+        lifecycleObserversView
+    }
 
-            screenLabelsOverlay
-
-            VStack {
-                Spacer()
-                HStack(alignment: .bottom) {
-                    horizontalMovePad
-                        .padding(.leading, 12)
-                        .padding(.bottom, 58)
-                    Spacer()
+    // ContentViewには多数のsheet／onChangeがあるため、1本の巨大なView式にすると
+    // Swiftコンパイラの型推論が時間切れになることがある。機能単位で式を分割し、
+    // 各段階を個別に型チェックできるようにする。
+    private var workspaceTabsView: some View {
+        TabView(selection: $selectedWorkspace) {
+            arWorkspace
+                .tag(MainWorkspace.ar)
+                .tabItem {
+                    Label("AR", systemImage: "viewfinder")
                 }
+
+            PlanMapSheet(isEmbedded: true) {
+                selectedWorkspace = .ar
+            }
+            .tag(MainWorkspace.map)
+            .tabItem {
+                Label("地図", systemImage: "map")
             }
 
-            VStack(spacing: 0) {
-                miniTopHUD
-                    .padding(.horizontal, 8)
-                    .padding(.top, 4)
-
-                quickGuideCard
-                    .padding(.horizontal, 8)
-                    .padding(.top, 4)
-
-                Spacer(minLength: 0)
-
-                compactBottomBar
-                    .padding(.horizontal, 8)
-                    .padding(.bottom, 6)
+            LayerManagerSheet(isEmbedded: true) {
+                model.arCameraActive = false
+                showImporter = true
+            }
+            .tag(MainWorkspace.data)
+            .tabItem {
+                Label("データ", systemImage: "square.stack.3d.up")
             }
         }
+        .toolbar(recordingUIHidden || presentationUIHidden ? .hidden : .visible, for: .tabBar)
+    }
+
+    private var fileImportView: some View {
+        workspaceTabsView
         .fileImporter(
             isPresented: $showImporter,
             allowedContentTypes: supportedImportTypes,
@@ -101,6 +129,10 @@ struct ContentView: View {
             }
             updateARCameraActivity()
         }
+    }
+
+    private var coordinateSheetsView: some View {
+        fileImportView
         .sheet(isPresented: $showLatLonInput) {
             LatLonInputSheet { lat, lon in model.setOrigin(latitude: lat, longitude: lon) }
         }
@@ -115,6 +147,10 @@ struct ContentView: View {
         .sheet(isPresented: $showPlanMap) {
             PlanMapSheet()
         }
+    }
+
+    private var utilitySheetsView: some View {
+        coordinateSheetsView
         .sheet(isPresented: $showSettings) {
             DisplaySettingsSheet()
         }
@@ -124,10 +160,33 @@ struct ContentView: View {
         .sheet(isPresented: $showHelp) {
             HelpSheet()
         }
+        .sheet(isPresented: $showAlignment) {
+            alignmentSheet
+        }
+        .sheet(isPresented: $showStatusDetails) {
+            statusDetailsSheet
+        }
+    }
+
+    private var dataImportSheetsView: some View {
+        utilitySheetsView
         .sheet(isPresented: $showGeoTIFFCoordinateSheet) {
-            GeoTIFFCoordinateSheet(initialSystem: model.planeSystemNumber) { mode in
+            GeoTIFFCoordinateSheet(initialSystem: model.planeSystemNumber) { purpose, mode in
                 if let data = pendingGeoTIFFData {
-                    model.importGeoTIFF(data: data, fileName: pendingGeoTIFFFileName, coordinateMode: mode)
+                    switch purpose {
+                    case .backgroundImage:
+                        model.importGeoTIFF(
+                            data: data,
+                            fileName: pendingGeoTIFFFileName,
+                            coordinateMode: mode
+                        )
+                    case .elevationDEM:
+                        model.importElevationGeoTIFF(
+                            data: data,
+                            fileName: pendingGeoTIFFFileName,
+                            coordinateMode: mode
+                        )
+                    }
                 }
                 pendingGeoTIFFData = nil
                 pendingGeoTIFFFileName = ""
@@ -144,34 +203,113 @@ struct ContentView: View {
                 pendingCSVFileName = ""
             }
         }
-        .confirmationDialog("現在地の指定方法", isPresented: $showCoordinateMenu, titleVisibility: .visible) {
-            Button("緯度経度を手入力") { showLatLonInput = true }
-            Button("平面直角座標を手入力") { showPlaneInput = true }
+    }
+
+    private var replaySheetView: some View {
+        dataImportSheetsView
+        .sheet(item: $replayPreview, onDismiss: updateARCameraActivity) { item in
+            ReplayPreviewSheet(previewController: item.controller) {
+                replayPreview = nil
+                updateARCameraActivity()
+            }
+        }
+    }
+
+    private var dialogsView: some View {
+        replaySheetView
+        .confirmationDialog("立ち位置の設定方法", isPresented: $showCoordinateMenu, titleVisibility: .visible) {
+            Button("iPhoneの現在位置を使う") { locationManager.requestCurrentLocationOnce() }
+            Button("読み込んだ点を立ち位置にする") { showPointSelection = true }
+                .disabled(model.importedPointList.isEmpty)
+            Button("緯度経度を入力") { showLatLonInput = true }
+            Button("平面直角座標を入力") { showPlaneInput = true }
             Button("キャンセル", role: .cancel) { }
         }
+    }
+
+    private var photoFeedbackView: some View {
+        dialogsView
+        .alert(
+            "写真を保存できませんでした",
+            isPresented: photoFailurePresentedBinding
+        ) {
+            if photoFailureMessage?.contains("許可") == true {
+                Button("iOSの設定を開く") {
+                    if let url = URL(string: UIApplication.openSettingsURLString) {
+                        openURL(url)
+                    }
+                }
+            }
+            Button("閉じる", role: .cancel) {
+                photoFailureMessage = nil
+                model.dismissPhotoCaptureFeedback()
+            }
+        } message: {
+            Text(photoFailureMessage ?? "写真の作成または保存に失敗しました")
+        }
+        .sensoryFeedback(.impact(weight: .medium), trigger: captureFeedbackTrigger)
+    }
+
+    private var primaryLifecycleObserversView: some View {
+        photoFeedbackView
         .onAppear {
             locationManager.requestAuthorizationIfNeeded()
             updateARCameraActivity()
         }
-        .onChange(of: showImporter) { _ in updateARCameraActivity() }
-        .onChange(of: showLatLonInput) { _ in updateARCameraActivity() }
-        .onChange(of: showPlaneInput) { _ in updateARCameraActivity() }
-        .onChange(of: showPointSelection) { _ in updateARCameraActivity() }
-        .onChange(of: showPlanMap) { _ in updateARCameraActivity() }
-        .onChange(of: showSettings) { _ in updateARCameraActivity() }
-        .onChange(of: showLayerManager) { _ in updateARCameraActivity() }
-        .onChange(of: showHelp) { _ in updateARCameraActivity() }
-        .onChange(of: showCoordinateMenu) { _ in updateARCameraActivity() }
-        .onChange(of: showGeoTIFFCoordinateSheet) { _ in updateARCameraActivity() }
-        .onChange(of: showCSVImportSheet) { _ in updateARCameraActivity() }
+        .onChange(of: showImporter) { updateARCameraActivity() }
+        .onChange(of: showLatLonInput) { updateARCameraActivity() }
+        .onChange(of: showPlaneInput) { updateARCameraActivity() }
+        .onChange(of: showPointSelection) { updateARCameraActivity() }
+        .onChange(of: showPlanMap) { updateARCameraActivity() }
+        .onChange(of: showSettings) { updateARCameraActivity() }
+        .onChange(of: showLayerManager) { updateARCameraActivity() }
+        .onChange(of: showHelp) { updateARCameraActivity() }
+    }
+
+    private var secondaryLifecycleObserversView: some View {
+        primaryLifecycleObserversView
+        .onChange(of: showCoordinateMenu) { updateARCameraActivity() }
+        .onChange(of: showGeoTIFFCoordinateSheet) { updateARCameraActivity() }
+        .onChange(of: showCSVImportSheet) { updateARCameraActivity() }
+        .onChange(of: replayPreview?.id) { updateARCameraActivity() }
+        .onChange(of: showAlignment) { updateARCameraActivity() }
+        .onChange(of: showStatusDetails) { updateARCameraActivity() }
+        .onChange(of: selectedWorkspace) { updateARCameraActivity() }
+        .onChange(of: scenePhase) { updateARCameraActivity() }
+    }
+
+    private var lifecycleObserversView: some View {
+        secondaryLifecycleObserversView
+        .onChange(of: model.photoCaptureState) { _, state in
+            if case .failure(let message) = state {
+                photoFailureMessage = message
+            }
+        }
+    }
+
+    private var photoFailurePresentedBinding: Binding<Bool> {
+        Binding(
+            get: { photoFailureMessage != nil },
+            set: { isPresented in
+                if !isPresented { photoFailureMessage = nil }
+            }
+        )
     }
 
     private var shouldPauseARCamera: Bool {
-        showImporter || showLatLonInput || showPlaneInput || showPointSelection || showPlanMap || showSettings || showLayerManager || showHelp || showCoordinateMenu || showGeoTIFFCoordinateSheet || showCSVImportSheet
+        scenePhase != .active || selectedWorkspace != .ar || showImporter || showLatLonInput || showPlaneInput || showPointSelection || showPlanMap || showSettings || showLayerManager || showHelp || showStatusDetails || showCoordinateMenu || showGeoTIFFCoordinateSheet || showCSVImportSheet || replayPreview != nil
     }
 
     private func updateARCameraActivity() {
         model.arCameraActive = !shouldPauseARCamera
+        locationManager.setHeadingUpdatesActive(!shouldPauseARCamera)
+    }
+
+    private var effectiveDisplayHeightBinding: Binding<Double> {
+        Binding(
+            get: { model.effectiveDisplayPlaneOffsetMeters },
+            set: { model.setEffectiveDisplayPlaneOffsetMeters($0) }
+        )
     }
 
     private var arAdjustmentGesture: some Gesture {
@@ -193,7 +331,7 @@ struct ContentView: View {
                         return
                     }
                     dragStartHeadingDegrees = model.headingOffsetDegrees
-                    dragStartPlaneOffsetMeters = model.displayPlaneOffsetMeters
+                    dragStartPlaneOffsetMeters = model.effectiveDisplayPlaneOffsetMeters
                 }
 
                 guard let axis = adjustmentAxis else { return }
@@ -204,7 +342,7 @@ struct ContentView: View {
                 case .height:
                     let sensitivityMetersPerPoint = 0.012
                     let next = dragStartPlaneOffsetMeters - Double(value.translation.height) * sensitivityMetersPerPoint
-                    model.displayPlaneOffsetMeters = min(100.0, max(-100.0, next))
+                    model.setEffectiveDisplayPlaneOffsetMeters(next)
                 }
             }
             .onEnded { _ in
@@ -213,7 +351,7 @@ struct ContentView: View {
                     case .heading:
                         model.statusMessage = "方位補正：\(model.displayHeadingOffsetDegrees.formatted(.number.precision(.fractionLength(1))))°"
                     case .height:
-                        model.statusMessage = "表示高さ：\(model.displayPlaneOffsetMeters.formatted(.number.precision(.fractionLength(2))))m"
+                        model.statusMessage = "表示高さ：\(model.effectiveDisplayPlaneOffsetMeters.formatted(.number.precision(.fractionLength(2))))m"
                     }
                 }
                 adjustmentAxis = nil
@@ -255,6 +393,7 @@ struct ContentView: View {
                         }
                     }
                     .foregroundStyle(.white)
+                    .opacity(label.opacity)
                     .position(x: label.x, y: adjustedLabelY(for: label))
             }
         }
@@ -262,99 +401,239 @@ struct ContentView: View {
         .allowsHitTesting(false)
     }
 
-    private var miniTopHUD: some View {
-        HStack(spacing: 8) {
-            VStack(alignment: .leading, spacing: 1) {
-                HStack(spacing: 5) {
-                    Text("AR地図")
-                        .font(.caption.bold())
-                    Text(model.arStatusMessage)
-                        .font(.caption2)
-                        .lineLimit(1)
-                        .foregroundStyle(.secondary)
-                }
+    private var arWorkspace: some View {
+        ZStack {
+            ARRendererView()
+                .ignoresSafeArea()
+                .contentShape(Rectangle())
+                .gesture(arAdjustmentGesture)
 
-                Text(topStatusText)
-                    .font(.caption2)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.72)
-                    .foregroundStyle(.secondary)
+            screenLabelsOverlay
 
-                Text("点\(model.settings.showPoints ? "ON" : "OFF") / 線\(model.settings.showLines ? "ON" : "OFF") / 点名\(model.settings.showLabels ? "ON" : "OFF") / 距離\(model.distancesEnabled ? "ON" : "OFF")")
-                    .font(.caption2)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.72)
-                    .foregroundStyle(.secondary)
-
-
-                Text("補正：方位 \(model.displayHeadingOffsetDegrees, specifier: "%+.1f")° / 高さ \(model.displayPlaneOffsetMeters, specifier: "%+.2f")m")
-                    .font(.caption2)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.72)
-                    .foregroundStyle(.secondary)
+            if photoFlashVisible {
+                Color.white
+                    .opacity(0.72)
+                    .ignoresSafeArea()
+                    .allowsHitTesting(false)
+                    .transition(.opacity)
             }
 
-            Spacer(minLength: 4)
-
-            Button { showHelp = true } label: { Image(systemName: "questionmark.circle") }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-        }
-        .padding(.horizontal, 9)
-        .padding(.vertical, 6)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
-    }
-
-    private var topStatusText: String {
-        if let origin = model.origin {
-            let lat = origin.latitude.formatted(.number.precision(.fractionLength(7)))
-            let lon = origin.longitude.formatted(.number.precision(.fractionLength(7)))
-            let renderText = model.renderLimitMessage.isEmpty ? model.statusMessage : model.renderLimitMessage
-            let rasterText = model.rasters.isEmpty ? "" : " / 画像\(model.rastersEnabled ? "ON" : "OFF")"
-            let selected = model.selectedPoint?.name.map { " / 選択：\($0)" } ?? ""
-            return "現在地：\(origin.name ?? "設定済み")  \(lat), \(lon) / \(renderText)\(rasterText)\(selected)"
-        } else {
-            return "現在地未設定 / \(model.statusMessage)"
+            if recordingStarting || isRecording {
+                recordingStopOverlay
+            } else if presentationUIHidden {
+                restoreARUIControl
+            } else if !recordingUIHidden {
+                arControlsOverlay
+            }
         }
     }
 
-    private var quickGuideCard: some View {
-        HStack(spacing: 8) {
-            Image(systemName: quickGuideIcon)
-                .font(.caption.weight(.semibold))
-            Text(quickGuideText)
-                .font(.caption2.weight(.semibold))
-                .lineLimit(2)
-                .minimumScaleFactor(0.74)
-            Spacer(minLength: 4)
+    private var arControlsOverlay: some View {
+        VStack(spacing: 8) {
+            HStack(spacing: 8) {
+                arStatusButton
+                Spacer(minLength: 4)
+                Button {
+                    withAnimation(.easeInOut(duration: 0.18)) {
+                        presentationUIHidden = true
+                    }
+                } label: {
+                    Image(systemName: "eye.slash.fill")
+                        .font(.title3)
+                        .frame(width: 34, height: 34)
+                        .background(.ultraThinMaterial, in: Circle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("操作UIを隠す")
+
+                arUtilityMenu
+            }
+            .padding(.horizontal, 10)
+            .padding(.top, 6)
+
+            Spacer(minLength: 0)
+
+            photoStatusBanner
+
+            HStack(alignment: .bottom, spacing: 8) {
+                if horizontalMovePadVisible {
+                    compactHorizontalMovePad
+                        .transition(.move(edge: .leading).combined(with: .opacity))
+                }
+
+                Spacer(minLength: 4)
+
+                compactCaptureControls
+            }
+            .padding(.horizontal, 10)
+            .padding(.bottom, 8)
         }
-        .padding(.horizontal, 9)
-        .padding(.vertical, 6)
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
     }
 
-    private var quickGuideIcon: String {
-        if model.features.isEmpty && model.rasters.isEmpty { return "1.circle" }
-        if model.origin == nil { return "2.circle" }
-        if model.selectedPoint == nil && !model.importedPointList.isEmpty { return "3.circle" }
-        return "checkmark.circle"
+    private var restoreARUIControl: some View {
+        VStack {
+            HStack {
+                Spacer()
+                Button {
+                    withAnimation(.easeInOut(duration: 0.18)) {
+                        presentationUIHidden = false
+                    }
+                } label: {
+                    Label("操作を表示", systemImage: "eye.fill")
+                        .labelStyle(.iconOnly)
+                        .font(.title3)
+                        .frame(width: 38, height: 38)
+                        .background(.ultraThinMaterial, in: Circle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("操作UIを表示")
+                .padding(.trailing, 10)
+                .padding(.top, 6)
+            }
+            Spacer()
+        }
     }
 
-    private var quickGuideText: String {
-        if model.features.isEmpty && model.rasters.isEmpty {
-            return "次の操作：読込を押してKML・KMZ・CSV・SIMA・GeoTIFFを選びます。"
+    private var arStatusButton: some View {
+        Button(action: performStatusAction) {
+            HStack(spacing: 7) {
+                Image(systemName: arStatusIcon)
+                    .foregroundStyle(arStatusTint)
+                Text(arStatusText)
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.78)
+                Image(systemName: "chevron.right")
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 11)
+            .padding(.vertical, 8)
+            .background(.ultraThinMaterial, in: Capsule())
+        }
+        .buttonStyle(.plain)
+        .accessibilityHint(arStatusAccessibilityHint)
+    }
+
+    private var arStatusText: String {
+        if model.features.isEmpty && model.rasters.isEmpty && model.elevationGrids.isEmpty {
+            return "データを追加してください"
         }
         if model.origin == nil {
-            return "次の操作：現在地取得、座標指定、または点から現在地を設定します。"
+            return "立ち位置を設定してください"
         }
-        if model.selectedPoint == nil && !model.importedPointList.isEmpty {
-            return "次の操作：平面図で確認し、目標点をタップしてARへ適用できます。"
+        if let selectedName = model.selectedPoint?.name, !selectedName.isEmpty {
+            return "\(model.arStatusMessage)・目標 \(selectedName)"
         }
-        return "AR表示中：左下パッドで水平移動、横スワイプで方位、縦スワイプで高さを調整できます。"
+        return model.arStatusMessage
     }
 
-    private var horizontalMovePad: some View {
-        VStack(alignment: .center, spacing: 5) {
+    private var arStatusIcon: String {
+        if model.features.isEmpty && model.rasters.isEmpty && model.elevationGrids.isEmpty { return "doc.badge.plus" }
+        if model.origin == nil { return "location.slash" }
+        if model.arStatusMessage.contains("失敗") || model.arStatusMessage.contains("エラー") {
+            return "exclamationmark.triangle.fill"
+        }
+        return "checkmark.circle.fill"
+    }
+
+    private var arStatusTint: Color {
+        if model.features.isEmpty && model.rasters.isEmpty && model.elevationGrids.isEmpty { return .orange }
+        if model.origin == nil { return .orange }
+        if model.arStatusMessage.contains("失敗") || model.arStatusMessage.contains("エラー") {
+            return .red
+        }
+        return .green
+    }
+
+    private var arStatusAccessibilityHint: String {
+        if model.features.isEmpty && model.rasters.isEmpty && model.elevationGrids.isEmpty { return "データ画面を開きます" }
+        if model.origin == nil { return "立ち位置の設定方法を表示します" }
+        return "ARの詳しい状態を表示します"
+    }
+
+    private func performStatusAction() {
+        if model.features.isEmpty && model.rasters.isEmpty && model.elevationGrids.isEmpty {
+            selectedWorkspace = .data
+        } else if model.origin == nil {
+            showCoordinateMenu = true
+        } else {
+            showStatusDetails = true
+        }
+    }
+
+    private var arUtilityMenu: some View {
+        Menu {
+            Button {
+                showCoordinateMenu = true
+            } label: {
+                Label("立ち位置を設定", systemImage: "location")
+            }
+
+            Button {
+                selectedWorkspace = .data
+            } label: {
+                Label("読み込んだデータ", systemImage: "square.stack.3d.up")
+            }
+
+            Button {
+                showSettings = true
+            } label: {
+                Label("詳細設定", systemImage: "gearshape")
+            }
+
+            Button(action: toggleTorch) {
+                Label(torchEnabled ? "ライトを消す" : "ライトをつける", systemImage: torchEnabled ? "flashlight.off.fill" : "flashlight.on.fill")
+            }
+
+            Divider()
+
+            Toggle("前後左右パッドを表示", isOn: $horizontalMovePadVisible)
+
+            Button {
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    presentationUIHidden = true
+                }
+            } label: {
+                Label("操作UIを隠す", systemImage: "eye.slash")
+            }
+
+            Divider()
+
+            Button {
+                showHelp = true
+            } label: {
+                Label("使い方・ヘルプ", systemImage: "questionmark.circle")
+            }
+        } label: {
+            Image(systemName: "ellipsis.circle.fill")
+                .font(.title2)
+                .foregroundStyle(.primary)
+                .padding(5)
+                .background(.ultraThinMaterial, in: Circle())
+        }
+        .accessibilityLabel("その他の操作")
+    }
+
+    private var compactHorizontalMovePad: some View {
+        VStack(spacing: 5) {
+            HStack(spacing: 4) {
+                Text("位置調整")
+                    .font(.caption2.weight(.semibold))
+                Spacer(minLength: 2)
+                Button {
+                    withAnimation(.easeInOut(duration: 0.15)) {
+                        horizontalMovePadVisible = false
+                    }
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.caption2.bold())
+                        .frame(width: 24, height: 24)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("前後左右パッドを隠す")
+            }
+
             HStack(spacing: 4) {
                 Button(horizontalPadFineMode ? "微" : "大") {
                     horizontalPadFineMode.toggle()
@@ -363,40 +642,54 @@ struct ContentView: View {
                 .font(.caption2.weight(.bold))
                 .buttonStyle(.borderedProminent)
                 .controlSize(.mini)
+                .tint(horizontalPadFineMode ? .cyan : .orange)
+                .disabled(model.origin == nil)
+                .accessibilityLabel("移動感度を切り替え")
+                .accessibilityValue(horizontalPadFineMode ? "微調整、1センチ" : "大移動、8センチ")
 
                 Button("中心を更新") {
                     model.updateOriginToCurrentPanCenter()
                 }
                 .font(.caption2.weight(.bold))
                 .lineLimit(1)
-                .minimumScaleFactor(0.75)
+                .minimumScaleFactor(0.72)
                 .buttonStyle(.bordered)
                 .controlSize(.mini)
+                .disabled(model.origin == nil)
+                .accessibilityLabel("現在の表示中心と高さを新しい基準にする")
             }
 
             ZStack {
                 Circle()
-                    .fill(.black.opacity(0.10))
-                    .overlay(Circle().stroke(.white.opacity(0.55), lineWidth: 1))
+                    .fill(.black.opacity(0.12))
+                    .overlay(Circle().stroke(.white.opacity(0.58), lineWidth: 1))
                     .frame(width: 82, height: 82)
 
                 Image(systemName: "arrow.up.and.down.and.arrow.left.and.right")
                     .font(.caption.weight(.semibold))
-                    .foregroundStyle(.white.opacity(0.82))
+                    .foregroundStyle(.white.opacity(0.72))
 
                 Circle()
-                    .fill(horizontalPadFineMode ? Color.cyan.opacity(0.72) : Color.orange.opacity(0.76))
-                    .overlay(Circle().stroke(.white.opacity(0.8), lineWidth: 1))
-                    .frame(width: 28, height: 28)
+                    .fill(horizontalPadFineMode ? Color.cyan.opacity(0.82) : Color.orange.opacity(0.84))
+                    .overlay(Circle().stroke(.white.opacity(0.86), lineWidth: 1))
+                    .frame(width: 30, height: 30)
                     .offset(clampedHorizontalPadOffset)
                     .shadow(radius: 2)
             }
+            .frame(width: 82, height: 82)
+            .contentShape(Circle())
             .gesture(horizontalPadGesture)
+            .opacity(model.origin == nil ? 0.45 : 1)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("前後左右の位置調整パッド")
+            .accessibilityValue(horizontalPadFineMode ? "微調整、1センチ" : "大移動、8センチ")
+            .accessibilityHint("動かしたい方向へドラッグします")
 
-            HStack(spacing: 4) {
+            HStack(spacing: 5) {
                 Text(horizontalPadFineMode ? "1cm" : "8cm")
                     .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.white.opacity(0.82))
+                    .foregroundStyle(.secondary)
+
                 Button("0") {
                     model.resetPlanePan()
                     model.statusMessage = "水平移動をリセットしました"
@@ -404,11 +697,13 @@ struct ContentView: View {
                 .font(.caption2.weight(.semibold))
                 .buttonStyle(.bordered)
                 .controlSize(.mini)
+                .disabled(model.origin == nil)
+                .accessibilityLabel("前後左右の調整を0に戻す")
             }
         }
-        .frame(width: 96)
         .padding(6)
-        .background(Color.clear, in: RoundedRectangle(cornerRadius: 12))
+        .frame(width: 112)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
     }
 
     private var clampedHorizontalPadOffset: CGSize {
@@ -416,90 +711,456 @@ struct ContentView: View {
         let length = hypot(horizontalPadDragOffset.width, horizontalPadDragOffset.height)
         guard length > maxRadius else { return horizontalPadDragOffset }
         let scale = maxRadius / length
-        return CGSize(width: horizontalPadDragOffset.width * scale, height: horizontalPadDragOffset.height * scale)
+        return CGSize(
+            width: horizontalPadDragOffset.width * scale,
+            height: horizontalPadDragOffset.height * scale
+        )
     }
 
     private var horizontalPadGesture: some Gesture {
         DragGesture(minimumDistance: 0, coordinateSpace: .local)
             .onChanged { value in
+                guard model.origin != nil else { return }
                 if !horizontalPadIsDragging {
+                    guard let screenBasis = model.currentHorizontalScreenBasis() else {
+                        model.statusMessage = "ARの正面方向を取得中です。少し待ってから操作してください"
+                        return
+                    }
                     horizontalPadIsDragging = true
                     horizontalPadDragStartEastMeters = model.planePanEastMeters
                     horizontalPadDragStartNorthMeters = model.planePanNorthMeters
+                    horizontalPadDragBasis = screenBasis
+                    horizontalPadDragHeadingDegrees = model.currentRenderedTotalHeadingDegrees()
                 }
+                guard let screenBasis = horizontalPadDragBasis else { return }
                 horizontalPadDragOffset = value.translation
                 let metersPerPoint = horizontalPadFineMode ? 0.01 : 0.08
                 model.setPlanePanFromScreenDrag(
                     startEast: horizontalPadDragStartEastMeters,
                     startNorth: horizontalPadDragStartNorthMeters,
                     translation: value.translation,
-                    metersPerPoint: metersPerPoint
+                    metersPerPoint: metersPerPoint,
+                    screenBasis: screenBasis,
+                    totalHeadingDegrees: horizontalPadDragHeadingDegrees
                 )
             }
             .onEnded { _ in
+                guard horizontalPadIsDragging else { return }
                 model.statusMessage = "水平移動：東西 \(model.planePanEastMeters.formatted(.number.precision(.fractionLength(2))))m / 南北 \(model.planePanNorthMeters.formatted(.number.precision(.fractionLength(2))))m"
-                horizontalPadDragOffset = .zero
+                withAnimation(.spring(response: 0.22, dampingFraction: 0.82)) {
+                    horizontalPadDragOffset = .zero
+                }
                 horizontalPadIsDragging = false
+                horizontalPadDragBasis = nil
+                horizontalPadDragHeadingDegrees = 0
             }
     }
 
-    private var compactBottomBar: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 7) {
-                Button("読込") {
-                    model.arCameraActive = false
-                    showImporter = true
-                }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
-
-                Button("現在地取得") { locationManager.requestCurrentLocationOnce() }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-
-                Button("座標指定") { showCoordinateMenu = true }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-
-                Button("点から現在地") { showPointSelection = true }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .disabled(model.importedPointList.isEmpty)
-
-                Button("平面図で選択") { showPlanMap = true }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .disabled(model.features.isEmpty && model.rasters.isEmpty)
-
-                Button("レイヤー") { showLayerManager = true }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .disabled(model.layers.isEmpty)
-
-                Button("設定") { showSettings = true }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-
-                Menu("表示") {
-                    Toggle("ポイント表示", isOn: $model.settings.showPoints)
-                    Toggle("ライン表示", isOn: $model.settings.showLines)
-                    Toggle("点名表示", isOn: $model.settings.showLabels)
-                    Toggle("距離表示", isOn: $model.distancesEnabled)
-                    Toggle("柱表示", isOn: $model.pillarsEnabled)
-                    Toggle("画像表示", isOn: $model.rastersEnabled).disabled(model.rasters.isEmpty)
-                    Toggle("LiDAR補助", isOn: $model.lidarEnabled)
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-
-                Button(torchEnabled ? "ライトON" : "ライト") { toggleTorch() }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
+    private var compactCaptureControls: some View {
+        HStack(spacing: 8) {
+            Button {
+                showAlignment = true
+            } label: {
+                Image(systemName: "move.3d")
+                    .font(.title3)
+                    .frame(width: 38, height: 38)
+                    .background(.regularMaterial, in: Circle())
             }
-            .padding(.horizontal, 9)
-            .padding(.vertical, 7)
+            .buttonStyle(.plain)
+            .accessibilityLabel("位置合わせの詳細")
+
+            photoCaptureButton
+            videoCaptureButton
+            displayItemsMenu
         }
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+        .padding(7)
+        .background(.ultraThinMaterial, in: Capsule())
+    }
+
+    private var photoCaptureButton: some View {
+        Button(action: performPhotoCapture) {
+            ZStack {
+                Circle()
+                    .fill(.white)
+                    .frame(width: 48, height: 48)
+                Circle()
+                    .stroke(.black.opacity(0.18), lineWidth: 1)
+                    .frame(width: 48, height: 48)
+
+                if photoCaptureIsBusy {
+                    ProgressView()
+                        .tint(.black)
+                } else {
+                    Image(systemName: "camera.fill")
+                        .font(.title3)
+                        .foregroundStyle(.black)
+                }
+            }
+            .shadow(radius: 2)
+        }
+        .buttonStyle(.plain)
+        .disabled(captureButtonDisabled)
+        .accessibilityLabel("AR写真を撮る")
+    }
+
+    private var videoCaptureButton: some View {
+        Button(action: startARRecording) {
+            Image(systemName: "video.fill")
+                .font(.callout.bold())
+                .foregroundStyle(.white)
+                .frame(width: 38, height: 38)
+                .background(.red.opacity(0.90), in: Circle())
+                .shadow(radius: 2)
+        }
+        .buttonStyle(.plain)
+        .disabled(captureButtonDisabled)
+        .accessibilityLabel("AR動画の録画を開始")
+    }
+
+    private var displayItemsMenu: some View {
+        Menu {
+            Toggle("点を表示", isOn: $model.settings.showPoints)
+            Toggle("線を表示", isOn: $model.settings.showLines)
+            Toggle("点名を表示", isOn: $model.settings.showLabels)
+            Toggle("距離を表示", isOn: $model.distancesEnabled)
+            Toggle("柱を表示", isOn: $model.pillarsEnabled)
+            Toggle("GeoTIFF画像を表示", isOn: $model.rastersEnabled)
+                .disabled(model.rasters.isEmpty)
+            Toggle("境界線をDEMの地形に沿わせる", isOn: $model.settings.boundaryTerrainFollowEnabled)
+                .disabled(!model.hasElevationDEM)
+
+            Divider()
+
+            Toggle("前後左右パッドを表示", isOn: $horizontalMovePadVisible)
+
+            Divider()
+
+            Toggle("LiDARを使用", isOn: $model.lidarEnabled)
+            Toggle("物体の後ろを薄く表示", isOn: $model.settings.lidarFadeBehindObjectsEnabled)
+                .disabled(!model.lidarEnabled)
+
+            Divider()
+
+            Button {
+                showSettings = true
+            } label: {
+                Label("詳しい表示設定", systemImage: "slider.horizontal.3")
+            }
+        } label: {
+            Image(systemName: "eye")
+                .font(.title3)
+                .frame(width: 38, height: 38)
+                .background(.regularMaterial, in: Circle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("表示項目")
+    }
+
+    private func performPhotoCapture() {
+        captureFeedbackTrigger &+= 1
+        withAnimation(.easeOut(duration: 0.04)) {
+            photoFlashVisible = true
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+            withAnimation(.easeOut(duration: 0.18)) {
+                photoFlashVisible = false
+            }
+        }
+        model.requestARPhotoCapture()
+    }
+
+    private var captureButtonDisabled: Bool {
+        recordingStarting || isRecording || photoCaptureIsBusy
+    }
+
+    private var photoCaptureIsBusy: Bool {
+        model.photoCaptureState.isBusy
+    }
+
+    @ViewBuilder
+    private var photoStatusBanner: some View {
+        switch model.photoCaptureState {
+        case .idle:
+            EmptyView()
+        case .capturing:
+            captureStatusPill(icon: "camera.viewfinder", text: "AR写真を作成中…", tint: .blue, showsProgress: true)
+        case .saving:
+            captureStatusPill(icon: "square.and.arrow.down", text: "写真アプリへ保存中…", tint: .blue, showsProgress: true)
+        case .success:
+            captureStatusPill(icon: "checkmark.circle.fill", text: "写真アプリに保存しました", tint: .green)
+        case .failure(let message):
+            captureStatusPill(icon: "exclamationmark.triangle.fill", text: message, tint: .red)
+        }
+    }
+
+    private func captureStatusPill(icon: String, text: String, tint: Color, showsProgress: Bool = false) -> some View {
+        HStack(spacing: 7) {
+            if showsProgress {
+                ProgressView()
+                    .controlSize(.small)
+            } else {
+                Image(systemName: icon)
+                    .foregroundStyle(tint)
+            }
+            Text(text)
+                .font(.caption.weight(.semibold))
+                .lineLimit(2)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(.ultraThinMaterial, in: Capsule())
+        .padding(.horizontal, 20)
+    }
+
+    private var alignmentSheet: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    GroupBox("立ち位置") {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text(model.origin?.name ?? "未設定")
+                                .font(.subheadline.weight(.semibold))
+                            Text("AR表示の基準となる、現在立っている位置です。")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Button("立ち位置を設定・変更") {
+                                showAlignment = false
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                                    showCoordinateMenu = true
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+
+                    GroupBox("表示位置を前後左右に合わせる") {
+                        VStack(alignment: .leading, spacing: 12) {
+                            Toggle("AR画面に前後左右パッドを表示", isOn: $horizontalMovePadVisible)
+
+                            Text("ゲームの移動パッドと同じように、丸いパッドを現在位置を移動したい方向へ倒します。上へ倒すと前進し、地物表示は反対へ動きます。「微／大」で感度を切り替え、位置と高さが合ったら「中心を更新」で新しい基準を確定します。「0」は水平調整だけをリセットします。")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+
+                            LabeledContent(
+                                "現在の補正",
+                                value: "東西 \(model.planePanEastMeters.formatted(.number.precision(.fractionLength(2))))m / 南北 \(model.planePanNorthMeters.formatted(.number.precision(.fractionLength(2))))m"
+                            )
+                            .font(.caption)
+
+                            HStack {
+                                Button("前後左右をリセット") {
+                                    model.resetPlanePan()
+                                    model.statusMessage = "前後左右の調整をリセットしました"
+                                }
+                                .buttonStyle(.bordered)
+
+                                Spacer()
+
+                                Button("この位置と高さを基準にする") {
+                                    model.updateOriginToCurrentPanCenter()
+                                }
+                                .buttonStyle(.borderedProminent)
+                            }
+                            .font(.caption)
+                        }
+                    }
+
+                    GroupBox("方位と高さ") {
+                        VStack(alignment: .leading, spacing: 14) {
+                            HStack {
+                                Text("方位の補正")
+                                Spacer()
+                                Text("\(model.displayHeadingOffsetDegrees, specifier: "%+.1f")°")
+                                    .monospacedDigit()
+                            }
+                            Slider(value: $model.headingOffsetDegrees, in: -180...180, step: 0.5)
+
+                            HStack {
+                                Text("表示する高さ")
+                                Spacer()
+                                Text("\(model.effectiveDisplayPlaneOffsetMeters, specifier: "%+.1f")m")
+                                    .monospacedDigit()
+                            }
+                            Slider(value: effectiveDisplayHeightBinding, in: -100...100, step: 0.1)
+
+                            HStack {
+                                Button("方位をリセット") {
+                                    model.headingOffsetDegrees = 0
+                                }
+                                .buttonStyle(.bordered)
+
+                                Button("高さを初期値へ") {
+                                    model.resetDisplayHeight()
+                                }
+                                .buttonStyle(.bordered)
+                            }
+                            .font(.caption)
+
+                            Text("AR画面では、横スワイプでも方位、縦スワイプでも高さを調整できます。")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                .padding()
+            }
+            .navigationTitle("位置合わせ")
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("完了") { showAlignment = false }
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
+    }
+
+    private var statusDetailsSheet: some View {
+        NavigationStack {
+            Form {
+                Section("ARの状態") {
+                    LabeledContent("追跡", value: model.arStatusMessage)
+                    Text(model.statusMessage)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Section("立ち位置") {
+                    if let origin = model.origin {
+                        LabeledContent("名称", value: origin.name ?? "設定済み")
+                        LabeledContent("緯度", value: origin.latitude.formatted(.number.precision(.fractionLength(7))))
+                        LabeledContent("経度", value: origin.longitude.formatted(.number.precision(.fractionLength(7))))
+                    } else {
+                        Text("未設定")
+                            .foregroundStyle(.secondary)
+                    }
+                    Button("立ち位置を設定・変更") {
+                        showStatusDetails = false
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                            showCoordinateMenu = true
+                        }
+                    }
+                }
+
+                Section("表示") {
+                    Text("点\(model.settings.showPoints ? "ON" : "OFF")・線\(model.settings.showLines ? "ON" : "OFF")・点名\(model.settings.showLabels ? "ON" : "OFF")・距離\(model.distancesEnabled ? "ON" : "OFF")")
+                    if let selectedName = model.selectedPoint?.name {
+                        LabeledContent("目標点", value: selectedName)
+                    }
+                    Text(model.renderLimitMessage)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    LabeledContent(
+                        "標高DEM",
+                        value: model.hasElevationDEM ? "使用可能" : "未読込"
+                    )
+                    if model.hasElevationDEM {
+                        Text(model.elevationDEMSummary)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                Section("位置合わせの値") {
+                    LabeledContent("方位", value: String(format: "%+.1f°", model.displayHeadingOffsetDegrees))
+                    LabeledContent("方位安定化", value: String(format: "%+.1f°", model.automaticHeadingCorrectionDegrees))
+                    LabeledContent("高さ", value: String(format: "%+.2fm", model.effectiveDisplayPlaneOffsetMeters))
+                    LabeledContent("東西", value: String(format: "%+.2fm", model.planePanEastMeters))
+                    LabeledContent("南北", value: String(format: "%+.2fm", model.planePanNorthMeters))
+                }
+            }
+            .navigationTitle("詳しい状態")
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("閉じる") { showStatusDetails = false }
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
+    }
+
+    private var recordingStopOverlay: some View {
+        VStack {
+            Spacer()
+            HStack {
+                Spacer()
+                Button {
+                    stopARRecording()
+                } label: {
+                    HStack(spacing: 7) {
+                        if recordingStarting {
+                            ProgressView()
+                                .tint(.white)
+                        } else {
+                            Image(systemName: "stop.fill")
+                        }
+                        Text(recordingStarting ? "録画準備中" : "録画停止")
+                    }
+                    .font(.callout.bold())
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    .background(.red.opacity(0.88), in: Capsule())
+                }
+                .disabled(recordingStarting)
+                .padding(.trailing, 14)
+                .padding(.bottom, 18)
+            }
+        }
+    }
+
+    private func startARRecording() {
+        let recorder = RPScreenRecorder.shared()
+        guard recorder.isAvailable else {
+            model.statusMessage = "この端末では画面録画を開始できません"
+            return
+        }
+
+        recorder.isMicrophoneEnabled = false
+        recordingUIHidden = true
+        recordingStarting = true
+        model.statusMessage = "AR動画の録画を準備中…"
+
+        // 通常の操作UIが画面から消えた次の描画後にReplayKitを開始する。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+            recorder.startRecording { error in
+                DispatchQueue.main.async {
+                    recordingStarting = false
+                    if let error {
+                        recordingUIHidden = false
+                        isRecording = false
+                        model.statusMessage = "録画開始エラー：\(error.localizedDescription)"
+                    } else {
+                        isRecording = true
+                        model.statusMessage = "AR動画を録画中"
+                    }
+                }
+            }
+        }
+    }
+
+    private func stopARRecording() {
+        guard isRecording else { return }
+        RPScreenRecorder.shared().stopRecording { previewController, error in
+            DispatchQueue.main.async {
+                isRecording = false
+                recordingStarting = false
+                recordingUIHidden = false
+
+                if let error {
+                    model.statusMessage = "録画停止エラー：\(error.localizedDescription)"
+                    return
+                }
+
+                if let previewController {
+                    replayPreview = ReplayPreviewItem(controller: previewController)
+                    updateARCameraActivity()
+                    model.statusMessage = "録画完了：保存または共有を選択してください"
+                } else {
+                    model.statusMessage = "録画は終了しましたが、保存・共有画面を開けませんでした"
+                }
+            }
+        }
     }
 
     private func toggleTorch() {
@@ -580,6 +1241,47 @@ struct ContentView: View {
 
 }
 
+final class ReplayPreviewItem: Identifiable {
+    let id = UUID()
+    let controller: RPPreviewViewController
+
+    init(controller: RPPreviewViewController) {
+        self.controller = controller
+    }
+}
+
+struct ReplayPreviewSheet: UIViewControllerRepresentable {
+    let previewController: RPPreviewViewController
+    var onFinish: () -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onFinish: onFinish)
+    }
+
+    func makeUIViewController(context: Context) -> RPPreviewViewController {
+        previewController.previewControllerDelegate = context.coordinator
+        return previewController
+    }
+
+    func updateUIViewController(_ uiViewController: RPPreviewViewController, context: Context) { }
+
+    static func dismantleUIViewController(_ uiViewController: RPPreviewViewController, coordinator: Coordinator) {
+        uiViewController.previewControllerDelegate = nil
+    }
+
+    final class Coordinator: NSObject, RPPreviewViewControllerDelegate {
+        let onFinish: () -> Void
+
+        init(onFinish: @escaping () -> Void) {
+            self.onFinish = onFinish
+        }
+
+        func previewControllerDidFinish(_ previewController: RPPreviewViewController) {
+            onFinish()
+        }
+    }
+}
+
 
 
 struct CSVImportSheet: View {
@@ -625,12 +1327,30 @@ struct CSVImportSheet: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Toggle("1行目を見出しとして扱う", isOn: $hasHeader)
-                    Picker("座標形式", selection: $coordinateKind) {
+                    HStack(spacing: 10) {
                         ForEach(CSVCoordinateKind.allCases) { kind in
-                            Text(kind.label).tag(kind)
+                            Button {
+                                coordinateKind = kind
+                            } label: {
+                                HStack(spacing: 6) {
+                                    if coordinateKind == kind {
+                                        Image(systemName: "checkmark.circle.fill")
+                                    }
+                                    Text(kind.label)
+                                        .lineLimit(1)
+                                }
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(coordinateKind == kind ? Color.white : Color.primary)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 9)
+                                .background(
+                                    coordinateKind == kind ? Color.accentColor : Color.secondary.opacity(0.14),
+                                    in: RoundedRectangle(cornerRadius: 10)
+                                )
+                            }
+                            .buttonStyle(.plain)
                         }
                     }
-                    .pickerStyle(.segmented)
 
                     if coordinateKind == .planeXY {
                         Stepper("平面直角座標系：\(planeSystemNumber)系", value: $planeSystemNumber, in: 1...19)
@@ -802,11 +1522,18 @@ private struct PlanProjection {
 struct PlanMapSheet: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
+    let isEmbedded: Bool
+    var onReturnToAR: (() -> Void)?
     @State private var draftSelectedPoint: GeoCoordinate?
     @State private var planZoom: Double = 1.0
     @State private var planPan: CGSize = .zero
     @State private var dragStartPlanPan: CGSize = .zero
     @State private var lastMagnificationValue: CGFloat = 1.0
+
+    init(isEmbedded: Bool = false, onReturnToAR: (() -> Void)? = nil) {
+        self.isEmbedded = isEmbedded
+        self.onReturnToAR = onReturnToAR
+    }
 
     var body: some View {
         NavigationStack {
@@ -865,7 +1592,7 @@ struct PlanMapSheet: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("選択中：\((draftSelectedPoint ?? model.selectedPoint)?.name ?? "なし")")
                         .font(.subheadline.weight(.semibold))
-                    Text("点をタップして選択できます。AR強調表示または現在地として適用できます。")
+                    Text("点をタップし、目標点または現在の立ち位置として設定できます。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -875,29 +1602,43 @@ struct PlanMapSheet: View {
                     Button("選択解除") { draftSelectedPoint = nil; model.selectedPoint = nil }
                         .buttonStyle(.bordered)
                     Spacer()
-                    Button("現在地にする") {
+                    Button("立ち位置にする") {
                         if let p = draftSelectedPoint ?? model.selectedPoint {
                             model.setOriginFromPoint(p)
                         }
-                        dismiss()
+                        finishSelection()
                     }
                     .buttonStyle(.bordered)
                     .disabled((draftSelectedPoint ?? model.selectedPoint) == nil)
 
-                    Button("ARへ適用") {
+                    Button("目標点に設定") {
                         if let p = draftSelectedPoint ?? model.selectedPoint {
                             model.selectPointForAR(p)
                         }
-                        dismiss()
+                        finishSelection()
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled((draftSelectedPoint ?? model.selectedPoint) == nil)
                 }
             }
             .padding()
-            .navigationTitle("平面図で選択")
-            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("閉じる") { dismiss() } } }
+            .navigationTitle(isEmbedded ? "地図" : "地図で目標点を選ぶ")
+            .toolbar {
+                if !isEmbedded {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("閉じる") { dismiss() }
+                    }
+                }
+            }
             .onAppear { draftSelectedPoint = model.selectedPoint }
+        }
+    }
+
+    private func finishSelection() {
+        if isEmbedded {
+            onReturnToAR?()
+        } else {
+            dismiss()
         }
     }
 
@@ -1072,17 +1813,47 @@ struct PlanMapSheet: View {
 struct LayerManagerSheet: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
+    let isEmbedded: Bool
+    var onAddData: (() -> Void)?
+
+    init(isEmbedded: Bool = false, onAddData: (() -> Void)? = nil) {
+        self.isEmbedded = isEmbedded
+        self.onAddData = onAddData
+    }
 
     var body: some View {
         NavigationStack {
             List {
+                if let onAddData {
+                    Section {
+                        Button(action: onAddData) {
+                            Label("データを追加", systemImage: "doc.badge.plus")
+                                .font(.headline)
+                                .frame(maxWidth: .infinity, alignment: .center)
+                                .padding(.vertical, 6)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .listRowBackground(Color.clear)
+
+                        Text("KML・KMZ・CSV・SIMA・GeoTIFF・基盤地図情報DEMに対応しています。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .center)
+                            .listRowBackground(Color.clear)
+                    }
+                }
+
                 if model.layers.isEmpty {
                     Section {
-                        Text("読込済みデータはありません。")
+                        ContentUnavailableView(
+                            "読み込んだデータはありません",
+                            systemImage: "square.stack.3d.up.slash",
+                            description: Text("上の「データを追加」から、表示するファイルを選んでください。")
+                        )
                             .foregroundStyle(.secondary)
                     }
                 } else {
-                    Section("読込済みデータ") {
+                    Section("読み込んだデータ") {
                         ForEach(model.layers) { layer in
                             HStack(alignment: .center, spacing: 10) {
                                 VStack(alignment: .leading, spacing: 3) {
@@ -1114,14 +1885,20 @@ struct LayerManagerSheet: View {
                     }
 
                     Section("説明") {
-                        Text("読み込んだファイルをレイヤーとして管理します。間違って読み込んだデータは削除できます。不要なデータは非表示にできます。表示制限・平面図・AR表示は、表示中のレイヤーだけを対象にします。")
+                        Text("読み込んだファイルをレイヤーとして管理します。間違って読み込んだデータは削除でき、不要なデータは非表示にできます。表示制限・地図・AR表示は、表示中のデータだけを対象にします。")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
                 }
             }
-            .navigationTitle("レイヤー")
-            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("閉じる") { dismiss() } } }
+            .navigationTitle(isEmbedded ? "データ" : "読み込んだデータ")
+            .toolbar {
+                if !isEmbedded {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("閉じる") { dismiss() }
+                    }
+                }
+            }
         }
     }
 
@@ -1130,6 +1907,7 @@ struct LayerManagerSheet: View {
         if layer.pointCount > 0 { parts.append("点\(layer.pointCount)") }
         if layer.lineCount > 0 { parts.append("線分\(layer.lineCount)") }
         if layer.rasterCount > 0 { parts.append("画像\(layer.rasterCount)") }
+        if layer.elevationGridCount > 0 { parts.append("DEM\(layer.elevationGridCount)") }
         return parts.isEmpty ? "要素なし" : parts.joined(separator: " / ")
     }
 }
@@ -1143,11 +1921,10 @@ struct DisplaySettingsSheet: View {
         NavigationStack {
             Form {
                 Section {
-                    Picker("設定区分", selection: $settingsPage) {
-                        Text("基本").tag(0)
-                        Text("詳細").tag(1)
+                    HStack(spacing: 10) {
+                        settingsPageButton(title: "基本", page: 0)
+                        settingsPageButton(title: "詳細", page: 1)
                     }
-                    .pickerStyle(.segmented)
                 }
 
                 if settingsPage == 0 {
@@ -1165,15 +1942,51 @@ struct DisplaySettingsSheet: View {
         }
     }
 
+    private func settingsPageButton(title: String, page: Int) -> some View {
+        Button {
+            settingsPage = page
+        } label: {
+            HStack(spacing: 6) {
+                if settingsPage == page {
+                    Image(systemName: "checkmark.circle.fill")
+                }
+                Text(title)
+            }
+            .font(.subheadline.weight(.semibold))
+            .foregroundStyle(settingsPage == page ? Color.white : Color.primary)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 9)
+            .background(
+                settingsPage == page ? Color.accentColor : Color.secondary.opacity(0.14),
+                in: RoundedRectangle(cornerRadius: 10)
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
     @ViewBuilder
     private var basicSettings: some View {
-        Section("基本：表示ON/OFF") {
-            Toggle("ポイント表示", isOn: $model.settings.showPoints)
-            Toggle("ライン表示", isOn: $model.settings.showLines)
-            Toggle("点名表示", isOn: $model.settings.showLabels)
+        Section("表示するもの") {
+            Toggle("点を表示", isOn: $model.settings.showPoints)
+            Toggle("線を表示", isOn: $model.settings.showLines)
+            Toggle("点名を表示", isOn: $model.settings.showLabels)
+            Toggle("距離を表示", isOn: $model.distancesEnabled)
+            Toggle("柱を表示", isOn: $model.pillarsEnabled)
+            Toggle("GeoTIFF画像を表示", isOn: $model.rastersEnabled)
+                .disabled(model.rasters.isEmpty)
         }
 
-        Section("基本：表示制限") {
+        Section("AR表示を安定させる") {
+            Toggle("方位を安定させる（コンパス使用）", isOn: $model.settings.headingStabilizationEnabled)
+            Text("森林や草地などで、端末を動かしていないのに表示が回る現象を軽減します。コンパスが乱れる場所ではOFFにできます。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder
+    private var detailedSettings: some View {
+        Section("詳細：表示範囲と件数") {
             Stepper("最大表示ポイント数：\(model.settings.maxDisplayPoints)", value: $model.settings.maxDisplayPoints, in: 0...10000, step: 50)
             Stepper("最大表示線分数：\(model.settings.maxDisplayLines)", value: $model.settings.maxDisplayLines, in: 0...5000, step: 25)
             Stepper("最大点名表示数：\(model.settings.maxLabelCount)", value: $model.settings.maxLabelCount, in: 0...500, step: 5)
@@ -1186,14 +1999,16 @@ struct DisplaySettingsSheet: View {
                 Slider(value: $model.settings.labelDistanceMeters, in: 0...1000, step: 10)
             }
         }
-    }
 
-    @ViewBuilder
-    private var detailedSettings: some View {
         Section("詳細：AR表示サイズ") {
-            sliderRow(title: "点の大きさ", value: $model.settings.arPointSize, range: 0.03...1.0, step: 0.01, unit: "m")
-            sliderRow(title: "選択点の球体", value: $model.settings.arSelectedSphereSize, range: 0.05...1.5, step: 0.01, unit: "m")
-            sliderRow(title: "ラインの太さ", value: $model.settings.arLineWidth, range: 0.005...0.3, step: 0.005, unit: "m")
+            sliderRow(title: "点の大きさ", value: $model.settings.arPointSize, range: 0.005...1.0, step: 0.005, unit: "m")
+            sliderRow(title: "選択点の球体", value: $model.settings.arSelectedSphereSize, range: 0.01...1.5, step: 0.005, unit: "m")
+            sliderRow(title: "ラインの太さ", value: $model.settings.arLineWidth, range: 0.001...0.3, step: 0.001, unit: "m")
+            Toggle("距離に応じて見やすい大きさにする", isOn: $model.settings.farMinimumSizeEnabled)
+            sliderRow(title: "遠方ポイント最小サイズ", value: $model.settings.farPointMinSize, range: 0.005...0.8, step: 0.005, unit: "m")
+                .disabled(!model.settings.farMinimumSizeEnabled)
+            sliderRow(title: "遠方ライン最小幅", value: $model.settings.farLineMinWidth, range: 0.001...0.25, step: 0.001, unit: "m")
+                .disabled(!model.settings.farMinimumSizeEnabled)
         }
 
         Section("詳細：平面図表示サイズ") {
@@ -1217,15 +2032,43 @@ struct DisplaySettingsSheet: View {
                 Text(model.settings.relativeAltitudeLimitMeters <= 0 ? "表示する高さ差：制限なし" : "表示する高さ差：±\(Int(model.settings.relativeAltitudeLimitMeters))mまで")
                 Slider(value: $model.settings.relativeAltitudeLimitMeters, in: 0...300, step: 5)
             }
-            Text("現在地付近を高さ0mとして、取り込んだ標高に合わせて点や線を上下に表示します。標高0・標高なしは読み込み時に近くの標高で概略補完します。AR表示中に近傍検索は行いません。")
+
+            Toggle("境界線をDEMの地形に沿わせる", isOn: $model.settings.boundaryTerrainFollowEnabled)
+                .disabled(!model.hasElevationDEM)
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("境界線の標高を読む間隔：\(Int(model.settings.demSampleSpacingMeters))m")
+                Slider(value: $model.settings.demSampleSpacingMeters, in: 1...50, step: 1)
+            }
+            .disabled(!model.hasElevationDEM || !model.settings.boundaryTerrainFollowEnabled)
+
+            if model.hasElevationDEM {
+                Text("ONにすると、境界線の途中にもDEMの標高を当てはめ、地形の起伏に沿って表示します。間隔を小さくすると細かな起伏を表現できますが、線が多い場合は処理が重くなります。通常は5mがおすすめです。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("この機能を使うには、データ画面から標高GeoTIFF、または基盤地図情報のDEM（XML・ZIP）を追加してください。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Text("「高さ情報を使う」をONにすると、現在地付近を高さ0mとして点や線を上下に表示します。DEMがない場所では、ファイルに含まれる標高を使用します。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
 
-        Section("詳細：遠方要素の最小表示") {
-            Toggle("遠方最小表示サイズを使う", isOn: $model.settings.farMinimumSizeEnabled)
-            sliderRow(title: "遠方ポイント最小サイズ", value: $model.settings.farPointMinSize, range: 0.02...0.8, step: 0.01, unit: "m")
-            sliderRow(title: "遠方ライン最小幅", value: $model.settings.farLineMinWidth, range: 0.005...0.25, step: 0.005, unit: "m")
+        Section("詳細：LiDAR") {
+            Toggle("LiDAR補助", isOn: $model.lidarEnabled)
+            Toggle("物体の後ろを薄く表示", isOn: $model.settings.lidarFadeBehindObjectsEnabled)
+                .disabled(!model.lidarEnabled)
+            VStack(alignment: .leading) {
+                Text("物体の後ろの不透明度：\(Int(model.settings.lidarBehindOpacity * 100))%")
+                Slider(value: $model.settings.lidarBehindOpacity, in: 0.05...0.85, step: 0.05)
+            }
+            .disabled(!model.lidarEnabled || !model.settings.lidarFadeBehindObjectsEnabled)
+            Text(model.lidarSupported ? "深度判定は毎秒数回、要素を分割して処理します。深度を取得できない場所は通常表示です。" : "LiDAR非対応端末では自動的に無効になります。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -1246,7 +2089,7 @@ struct LatLonInputSheet: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("現在地を緯度経度で指定") {
+                Section("立ち位置を緯度経度で指定") {
                     TextField("緯度 例：36.321234", text: $latitudeText).keyboardType(.numbersAndPunctuation)
                     TextField("経度 例：139.012345", text: $longitudeText).keyboardType(.numbersAndPunctuation)
                 }
@@ -1285,7 +2128,7 @@ struct PlaneInputSheet: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
-                Section("現在地を座標で指定") {
+                Section("立ち位置を座標で指定") {
                     TextField("X座標 例：95487.627", text: $xText).keyboardType(.numbersAndPunctuation)
                     TextField("Y座標 例：-26767.103", text: $yText).keyboardType(.numbersAndPunctuation)
                 }
@@ -1305,11 +2148,12 @@ struct PlaneInputSheet: View {
 
 struct GeoTIFFCoordinateSheet: View {
     @Environment(\.dismiss) private var dismiss
+    @State private var purpose: GeoTIFFImportPurpose = .backgroundImage
     @State private var usePlaneRectangular = true
     @State private var systemNumber: Int
-    var onApply: (GeoTIFFCoordinateMode) -> Void
+    var onApply: (GeoTIFFImportPurpose, GeoTIFFCoordinateMode) -> Void
 
-    init(initialSystem: Int, onApply: @escaping (GeoTIFFCoordinateMode) -> Void) {
+    init(initialSystem: Int, onApply: @escaping (GeoTIFFImportPurpose, GeoTIFFCoordinateMode) -> Void) {
         _systemNumber = State(initialValue: initialSystem)
         self.onApply = onApply
     }
@@ -1317,6 +2161,32 @@ struct GeoTIFFCoordinateSheet: View {
     var body: some View {
         NavigationStack {
             Form {
+                Section("このGeoTIFFの用途") {
+                    HStack(spacing: 10) {
+                        geoTIFFPurposeButton(
+                            title: "背景画像",
+                            systemImage: "map",
+                            value: .backgroundImage
+                        )
+                        geoTIFFPurposeButton(
+                            title: "標高DEM",
+                            systemImage: "mountain.2",
+                            value: .elevationDEM
+                        )
+                    }
+
+                    switch purpose {
+                    case .backgroundImage:
+                        Text("地図や航空写真などを、ARと平面図の背景画像として表示します。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    case .elevationDEM:
+                        Text("画素に記録された標高を読み取り、境界線を地形の起伏に沿わせます。通常の写真や地図画像はこちらを選ばないでください。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
                 Section("GeoTIFFの座標系") {
                     HStack(spacing: 8) {
                         Button("平面直角座標系") { usePlaneRectangular = true }
@@ -1340,8 +2210,11 @@ struct GeoTIFFCoordinateSheet: View {
                 }
 
                 Section {
-                    Button("この座標系で読み込む") {
-                        onApply(usePlaneRectangular ? .planeRectangular(system: systemNumber) : .geographic)
+                    Button(purpose == .backgroundImage ? "背景画像として読み込む" : "標高DEMとして読み込む") {
+                        onApply(
+                            purpose,
+                            usePlaneRectangular ? .planeRectangular(system: systemNumber) : .geographic
+                        )
                         dismiss()
                     }
                 }
@@ -1349,6 +2222,31 @@ struct GeoTIFFCoordinateSheet: View {
             .navigationTitle("GeoTIFF読込")
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("閉じる") { dismiss() } } }
         }
+    }
+
+    private func geoTIFFPurposeButton(
+        title: String,
+        systemImage: String,
+        value: GeoTIFFImportPurpose
+    ) -> some View {
+        Button {
+            purpose = value
+        } label: {
+            VStack(spacing: 5) {
+                Image(systemName: systemImage)
+                Text(title)
+                    .lineLimit(1)
+            }
+            .font(.subheadline.weight(.semibold))
+            .foregroundStyle(purpose == value ? Color.white : Color.primary)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 10)
+            .background(
+                purpose == value ? Color.accentColor : Color.secondary.opacity(0.14),
+                in: RoundedRectangle(cornerRadius: 10)
+            )
+        }
+        .buttonStyle(.plain)
     }
 }
 
@@ -1383,7 +2281,7 @@ struct PointSelectionSheet: View {
                 }
             }
             .searchable(text: $searchText, placement: .navigationBarDrawer(displayMode: .always), prompt: "点名を検索")
-            .navigationTitle("点から現在地選択")
+            .navigationTitle("点から立ち位置を選ぶ")
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("閉じる") { dismiss() } } }
             .overlay {
                 if filteredPoints.isEmpty {
@@ -1400,24 +2298,55 @@ struct HelpSheet: View {
     var body: some View {
         NavigationStack {
             List {
-                Section("仕様") {
-                    Text("AR画面のスワイプは方位・高さの微調整だけに使います。横スワイプで方位、縦スワイプで高さを調整します。高さ範囲は-100m〜+100mです。斜めスワイプ時は、横または縦のどちらか一方だけが反映されます。")
-                    Text("平面図ボタンから、読み込んだ点・線を平面的に確認し、点をタップしてAR上で強調表示できます。")
-                    Text("大量データは表示数・表示半径・点名数で制限し、近い要素を優先して表示します。")
-                    Text("設定はアプリ再起動後も保持されます。")
-                    Text("高さは初期状態では使いません。表示設定で『高さ情報を使う（概略）』をONにした場合だけ、KML/CSV/SIMAの有効な標高を現在地付近からの高さ差としてAR表示に反映します。")
+                Section("はじめて使う") {
+                    Label("1. 「データ」で表示するファイルを追加します。", systemImage: "1.circle")
+                    Label("2. AR画面で立ち位置を設定します。通常は「iPhoneの現在位置を使う」を選びます。", systemImage: "2.circle")
+                    Label("3. 必要に応じて「地図」で目標点を選び、AR画面の「位置合わせ」で表示を調整します。", systemImage: "3.circle")
                 }
+
+                Section("3つの画面") {
+                    Text("「AR」では現地映像に点・線・GeoTIFFを重ね、写真や動画を記録できます。")
+                    Text("「地図」ではデータを平面的に確認し、目標点または立ち位置を選べます。")
+                    Text("「データ」ではファイルの追加、表示・非表示、削除ができます。")
+                }
+
+                Section("位置合わせ") {
+                    Text("「立ち位置」は、AR表示の基準となる現在立っている位置です。iPhoneの現在位置、読み込んだ点、緯度経度、平面直角座標から設定できます。")
+                    Text("AR画面左下の丸いパッドを、現在位置を移動したい方向へ倒すと、ゲームの移動操作と同じ感覚で前後左右を調整できます。上へ倒すと前進し、地物表示は反対へ動きます。「微／大」で感度を切り替え、位置と高さが合ったら「中心を更新」を押します。表示を動かさず、現在の位置と高さが新しい基準として確定されます。「0」は水平調整だけをリセットします。")
+                    Text("パッドは×で隠せます。「表示項目」または右上の「…」から再表示できます。方位はAR画面の横スワイプ、高さは縦スワイプでも調整できます。")
+                }
+
+                Section("画面を人に見せるとき") {
+                    Text("右上の目に斜線が付いたボタンを押すと、タブバーや調整・撮影ボタンをまとめて隠せます。右上に残る小さな目のボタンで操作UIを戻します。")
+                    Text("写真と動画は、AR画面右下の白いカメラボタンと赤い動画ボタンから直接操作します。横に滑らせる切替操作は使用しません。")
+                }
+
                 Section("対応データ") {
-                    Text("KML / KMZ / CSV / SIMA / GeoTIFF")
-                    Text("GeoTIFFは簡易対応です。読込時に座標系をユーザー指定します。大きな画像は表示用に最大辺2048px程度へ縮小します。設定画面の不透明度スライダーはAR上のGeoTIFF表示に反映されます。初期値は35%です。")
-                    Text("高さは初期状態では使いません。必要な場合は表示設定で『高さ情報を使う（概略）』をONにします。現在地付近の標高を0mとして表示し、標高0・標高なしは読み込み時に近くの有効な標高で概略補完します。")
+                    Text("KML / KMZ / CSV / SIMA / GeoTIFF / 基盤地図情報DEM")
+                    Text("GeoTIFFを選ぶと、最初に用途を確認します。地図や航空写真は「背景画像」、標高値が入ったGeoTIFFは「標高DEM」を選んでください。背景画像は表示用に最大辺2048px程度へ縮小し、不透明度の初期値は35%です。")
+                    Text("国土地理院の基盤地図情報DEMは、ダウンロードしたZIPのまま、または中のXMLを読み込めます。表示設定の「境界線をDEMの地形に沿わせる」をONにすると、境界線の途中にも標高を当てはめます。")
+                    Text("高さは通常の初期状態では使いません。DEMを読み込むと自動でONになります。手動で使う場合は表示設定の「高さ情報を使う（概略）」をONにします。現在地付近の標高を0mとして表示し、DEMがない場所ではファイルに含まれる標高を使用します。")
                 }
-                Section("表示設定") {
-                    Text("ポイント・ライン・点名のON/OFF、最大表示数、表示半径、サイズ、線幅、遠方最小表示サイズを設定できます。")
-                    Text("距離表示は表示メニューから任意でONにできます。")
+
+                Section("LiDARと方位安定化") {
+                    Text("LiDAR対応端末では「物体の後ろを薄く表示」を利用できます。深度を取得できない場所は通常表示になります。")
+                    Text("方位安定化は、コンパスを使って森林や草地での表示回転を軽減します。コンパスが乱れる場所ではOFFにできます。")
+                }
+
+                Section("表示が合わないとき") {
+                    Text("まず立ち位置を確認し、その後に前後左右、方位、高さの順で調整してください。")
+                    Text("大量データで動作が重い場合は、詳細設定で最大表示数や表示半径を小さくしてください。設定はアプリ再起動後も保持されます。")
+                }
+
+                Section("プライバシー") {
+                    if let privacyPolicyURL = URL(string: "https://github.com/early277/ARCoordinateViewer/blob/main/PrivacyPolicy.md") {
+                        Link(destination: privacyPolicyURL) {
+                            Label("プライバシーポリシー", systemImage: "hand.raised")
+                        }
+                    }
                 }
             }
-            .navigationTitle("説明")
+            .navigationTitle("使い方・ヘルプ")
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("閉じる") { dismiss() } } }
         }
     }
