@@ -164,6 +164,51 @@ enum JapanesePlaneRectangularSystem {
         return GeoCoordinate(name: nil, latitude: lat * 180.0 / .pi, longitude: lon * 180.0 / .pi, altitude: nil)
     }
 
+    /// 緯度経度から日本の平面直角座標（X=北方向、Y=東方向）へ変換する。
+    /// `toGeodetic` と同じGRS80楕円体・縮尺係数を用いる。
+    static func fromGeodetic(
+        system: Int,
+        latitude: Double,
+        longitude: Double
+    ) throws -> (x: Double, y: Double) {
+        guard let origin = origins[system] else { throw CoordinateError.invalidPlaneSystem }
+        guard latitude.isFinite,
+              longitude.isFinite,
+              (-90.0...90.0).contains(latitude),
+              (-180.0...180.0).contains(longitude) else {
+            throw CoordinateError.invalidNumber
+        }
+
+        let lat = latitude * .pi / 180.0
+        let lon = longitude * .pi / 180.0
+        let lat0 = origin.lat * .pi / 180.0
+        let lon0 = origin.lon * .pi / 180.0
+        let sinLat = sin(lat)
+        let cosLat = cos(lat)
+        let tanLat = tan(lat)
+        let n = a / sqrt(1.0 - e2 * sinLat * sinLat)
+        let t = tanLat * tanLat
+        let c = ep2 * cosLat * cosLat
+        let aTerm = (lon - lon0) * cosLat
+        let meridionalDifference = meridionalArc(lat) - meridionalArc(lat0)
+
+        let x = scaleFactor * (
+            meridionalDifference
+            + n * tanLat * (
+                pow(aTerm, 2) / 2.0
+                + (5.0 - t + 9.0 * c + 4.0 * c * c) * pow(aTerm, 4) / 24.0
+                + (61.0 - 58.0 * t + t * t + 600.0 * c - 330.0 * ep2) * pow(aTerm, 6) / 720.0
+            )
+        )
+
+        let y = scaleFactor * n * (
+            aTerm
+            + (1.0 - t + c) * pow(aTerm, 3) / 6.0
+            + (5.0 - 18.0 * t + t * t + 14.0 * c - 58.0 * t * c) * pow(aTerm, 5) / 120.0
+        )
+        return (x, y)
+    }
+
     static func meridionalArc(_ lat: Double) -> Double {
         let e4 = e2 * e2
         let e6 = e4 * e2

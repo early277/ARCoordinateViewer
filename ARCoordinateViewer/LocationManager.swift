@@ -1,5 +1,6 @@
 import Foundation
 import CoreLocation
+import UIKit
 
 @MainActor
 final class LocationManager: NSObject, ObservableObject, CLLocationManagerDelegate {
@@ -8,6 +9,8 @@ final class LocationManager: NSObject, ObservableObject, CLLocationManagerDelega
     @Published var authorizationStatus: CLAuthorizationStatus = .notDetermined
     @Published var lastLocation: CLLocation?
     @Published var locationMessage: String = "位置情報未取得"
+    @Published var compassHeadingDegrees: Double?
+    @Published var compassAccuracyDegrees: Double = -1
 
     var onLocation: ((CLLocation) -> Void)?
 
@@ -16,7 +19,36 @@ final class LocationManager: NSObject, ObservableObject, CLLocationManagerDelega
         manager.delegate = self
         manager.desiredAccuracy = kCLLocationAccuracyBest
         manager.distanceFilter = kCLDistanceFilterNone
+        manager.headingFilter = 1
         authorizationStatus = manager.authorizationStatus
+    }
+
+    func setHeadingUpdatesActive(_ active: Bool) {
+        guard CLLocationManager.headingAvailable() else {
+            compassHeadingDegrees = nil
+            compassAccuracyDegrees = -1
+            return
+        }
+
+        if active {
+            updateHeadingOrientation()
+            manager.startUpdatingHeading()
+        } else {
+            manager.stopUpdatingHeading()
+        }
+    }
+
+    private func updateHeadingOrientation() {
+        switch UIDevice.current.orientation {
+        case .landscapeLeft:
+            manager.headingOrientation = .landscapeRight
+        case .landscapeRight:
+            manager.headingOrientation = .landscapeLeft
+        case .portraitUpsideDown:
+            manager.headingOrientation = .portraitUpsideDown
+        default:
+            manager.headingOrientation = .portrait
+        }
     }
 
     func requestAuthorizationIfNeeded() {
@@ -55,6 +87,15 @@ final class LocationManager: NSObject, ObservableObject, CLLocationManagerDelega
             lastLocation = location
             locationMessage = "水平精度：約\(Int(location.horizontalAccuracy))m"
             onLocation?(location)
+        }
+    }
+
+    nonisolated func locationManager(_ manager: CLLocationManager, didUpdateHeading newHeading: CLHeading) {
+        let heading = newHeading.trueHeading >= 0 ? newHeading.trueHeading : newHeading.magneticHeading
+        let accuracy = newHeading.headingAccuracy
+        Task { @MainActor in
+            compassHeadingDegrees = heading
+            compassAccuracyDegrees = accuracy
         }
     }
 

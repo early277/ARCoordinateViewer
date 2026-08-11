@@ -119,7 +119,7 @@ enum SIMAParser {
             coord.name = name
             coord.altitude = z
 
-            var aliases = [pointNumber, pointName, name]
+            let aliases = [pointNumber, pointName, name]
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                 .filter { !$0.isEmpty }
             return SIMAPoint(aliases: Array(Set(aliases)), coordinate: coord)
