@@ -1,6 +1,50 @@
 import Foundation
 import Compression
 
+/// DEMを読み込む対象範囲。緯度経度の外接矩形で表す。
+///
+/// 既存の点・線データから作成し、ZIP内の3次メッシュXMLを
+/// 完全展開する前の選別に使う。
+struct DEMImportRegion: Equatable, Sendable {
+    var minimumLatitude: Double
+    var maximumLatitude: Double
+    var minimumLongitude: Double
+    var maximumLongitude: Double
+
+    init(
+        minimumLatitude: Double,
+        maximumLatitude: Double,
+        minimumLongitude: Double,
+        maximumLongitude: Double
+    ) {
+        self.minimumLatitude = min(minimumLatitude, maximumLatitude)
+        self.maximumLatitude = max(minimumLatitude, maximumLatitude)
+        self.minimumLongitude = min(minimumLongitude, maximumLongitude)
+        self.maximumLongitude = max(minimumLongitude, maximumLongitude)
+    }
+
+    func expanded(by meters: Double) -> DEMImportRegion {
+        guard meters.isFinite, meters > 0 else { return self }
+        let centerLatitude = (minimumLatitude + maximumLatitude) * 0.5
+        let latitudeDegrees = meters / 111_320.0
+        let longitudeScale = max(0.1, cos(centerLatitude * .pi / 180.0))
+        let longitudeDegrees = meters / (111_320.0 * longitudeScale)
+        return DEMImportRegion(
+            minimumLatitude: max(minimumLatitude - latitudeDegrees, -90),
+            maximumLatitude: min(maximumLatitude + latitudeDegrees, 90),
+            minimumLongitude: minimumLongitude - longitudeDegrees,
+            maximumLongitude: maximumLongitude + longitudeDegrees
+        )
+    }
+
+    func intersects(_ other: DEMImportRegion) -> Bool {
+        maximumLatitude >= other.minimumLatitude
+            && other.maximumLatitude >= minimumLatitude
+            && maximumLongitude >= other.minimumLongitude
+            && other.maximumLongitude >= minimumLongitude
+    }
+}
+
 enum ElevationDEMError: LocalizedError {
     case notGSIDEM
     case invalidXML(String)
@@ -19,6 +63,8 @@ enum ElevationDEMError: LocalizedError {
     case zipIntegrityFailed
     case decompressionFailed
     case noDEMXML
+    case noDEMXMLInTargetRegion
+    case nestedZIPUnsupported
 
     var errorDescription: String? {
         switch self {
@@ -56,13 +102,21 @@ enum ElevationDEMError: LocalizedError {
             return "ZIP内DEMの展開に失敗しました。"
         case .noDEMXML:
             return "ZIP内に基盤地図情報DEMのXMLが見つかりません。"
+        case .noDEMXMLInTargetRegion:
+            return "対象データの範囲に重なる基盤地図情報DEMがありません。"
+        case .nestedZIPUnsupported:
+            return "まとめてダウンロードした外側のZIPです。内側のFG-GML-DEM ZIPを選択してください。"
         }
     }
 }
 
 enum GSIElevationDEMParser {
     private static let maximumCellsPerGrid = 2_000_000
-    private static let maximumCellsPerImport = 12_000_000
+    // 1m DEMの配布ZIPは、複数の3次メッシュXMLをまとめて含むことがある。
+    // 1枚あたりは1125×750セル（843,750セル）なので、従来の12Mセル上限では
+    // 1mデータだけがZIP全体の途中で止まりやすかった。Float配列で保持する上限は
+    // 48Mセル（約192MB）に留め、端末上での過大な展開を避ける。
+    private static let maximumCellsPerImport = 48_000_000
 
     static func parseXML(data: Data, fileName: String) throws -> ElevationGrid {
         let delegate = GSIDEMXMLDelegate(fileName: fileName, maximumCells: maximumCellsPerGrid)
@@ -84,19 +138,66 @@ enum GSIElevationDEMParser {
         return try delegate.makeGrid()
     }
 
-    static func parseZIP(data: Data, fileName: String) throws -> [ElevationGrid] {
+    static func parseZIP(
+        data: Data,
+        fileName: String,
+        targetRegion: DEMImportRegion? = nil,
+        progress: ((Double, String) -> Void)? = nil
+    ) throws -> [ElevationGrid] {
+        progress?(0, "ZIPの構造を確認中…")
         let archive = try DEMZIPArchive(data: data)
-        let xmlEntries = archive.entries
+        let allXMLEntries = archive.entries
             .filter { $0.name.lowercased().hasSuffix(".xml") }
             .sorted { lhs, rhs in
                 demPriority(for: lhs.name) < demPriority(for: rhs.name)
             }
-        guard !xmlEntries.isEmpty else { throw ElevationDEMError.noDEMXML }
+        guard !allXMLEntries.isEmpty else {
+            if archive.entries.contains(where: { $0.name.lowercased().hasSuffix(".zip") }) {
+                throw ElevationDEMError.nestedZIPUnsupported
+            }
+            throw ElevationDEMError.noDEMXML
+        }
+
+        let xmlEntries: [DEMZIPEntry]
+        if let targetRegion {
+            let selected = allXMLEntries.filter { entry in
+                guard let tileRegion = tileRegion(for: entry.name) else {
+                    // 現行の基盤地図情報DEMの標準ファイル名は3次メッシュ番号を
+                    // 含む。判定できないXMLは欠落を避けるため保守的に残す。
+                    return true
+                }
+                return tileRegion.intersects(targetRegion)
+            }
+            guard !selected.isEmpty else {
+                throw ElevationDEMError.noDEMXMLInTargetRegion
+            }
+            xmlEntries = selected
+            progress?(
+                0.01,
+                "対象範囲のDEM XMLを選別しました（"
+                    + String(selected.count)
+                    + "/"
+                    + String(allXMLEntries.count)
+                    + "枚）"
+            )
+        } else {
+            xmlEntries = allXMLEntries
+        }
+
+        // 対象範囲がある場合は、選別されたXMLだけを展開量の上限に含める。
+        // ZIP全体のメタデータには対象外タイルのサイズも含まれるため、ここで
+        // archive.entries 全体を検査すると、必要な範囲だけ読み込む前に失敗する。
+        try archive.validateExpandedSize(of: targetRegion == nil ? archive.entries : xmlEntries)
 
         var grids: [ElevationGrid] = []
         var totalCells = 0
 
-        for entry in xmlEntries {
+        for (index, entry) in xmlEntries.enumerated() {
+            let entryProgress = Double(index) / Double(max(xmlEntries.count, 1))
+            progress?(
+                entryProgress,
+                "DEM XMLを解析中… " + String(index + 1) + "/" + String(xmlEntries.count)
+            )
             do {
                 let xml = try archive.extract(entry)
                 let grid = try parseXML(data: xml, fileName: entry.name)
@@ -106,6 +207,16 @@ enum GSIElevationDEMParser {
                 }
                 totalCells = nextCellCount
                 grids.append(grid)
+                progress?(
+                    Double(index + 1) / Double(max(xmlEntries.count, 1)),
+                    "DEM XMLを解析中… "
+                        + String(index + 1)
+                        + "/"
+                        + String(xmlEntries.count)
+                        + "（"
+                        + totalCells.formatted()
+                        + "セル）"
+                )
             } catch ElevationDEMError.notGSIDEM {
                 continue
             } catch {
@@ -135,6 +246,66 @@ enum GSIElevationDEMParser {
         if upper.contains("DEM10A") { return 4 }
         if upper.contains("DEM10B") { return 5 }
         return 6
+    }
+
+    /// 基盤地図情報DEMの標準XMLファイル名から3次メッシュの範囲を求める。
+    ///
+    /// 例：FG-GML-5538-16-01-DEM1A-20251208.xml
+    /// 1次メッシュ緯度2桁・経度2桁、2次メッシュ緯度経度各1桁、
+    /// 3次メッシュ緯度経度各1桁という標準地域メッシュの定義を使う。
+    private static func tileRegion(for fileName: String) -> DEMImportRegion? {
+        let baseName = URL(fileURLWithPath: fileName)
+            .deletingPathExtension()
+            .lastPathComponent
+        let parts = baseName.split(separator: "-").map(String.init)
+        guard let demIndex = parts.firstIndex(where: { $0.uppercased().hasPrefix("DEM") }) else {
+            return nil
+        }
+
+        let preceding = parts[..<demIndex].filter { part in
+            !part.isEmpty && part.unicodeScalars.allSatisfy {
+                CharacterSet.decimalDigits.contains($0)
+            }
+        }
+        let code: String
+        if let combined = preceding.last, combined.count == 8 {
+            code = combined
+        } else if preceding.count >= 3,
+                  preceding[preceding.count - 3].count == 4,
+                  preceding[preceding.count - 2].count == 2,
+                  preceding[preceding.count - 1].count == 2 {
+            code = preceding[(preceding.count - 3)...].joined()
+        } else {
+            return nil
+        }
+
+        let digits = Array(code)
+        guard digits.count == 8,
+              let firstLatitude = Int(String(digits[0...1])),
+              let firstLongitude = Int(String(digits[2...3])),
+              let secondLatitude = Int(String(digits[4])),
+              let secondLongitude = Int(String(digits[5])),
+              let thirdLatitude = Int(String(digits[6])),
+              let thirdLongitude = Int(String(digits[7])),
+              secondLatitude <= 7,
+              secondLongitude <= 7,
+              thirdLatitude <= 9,
+              thirdLongitude <= 9 else {
+            return nil
+        }
+
+        let minimumLatitude = Double(firstLatitude) / 1.5
+            + Double(secondLatitude) / 12.0
+            + Double(thirdLatitude) / 120.0
+        let minimumLongitude = 100.0 + Double(firstLongitude)
+            + Double(secondLongitude) / 8.0
+            + Double(thirdLongitude) / 80.0
+        return DEMImportRegion(
+            minimumLatitude: minimumLatitude,
+            maximumLatitude: minimumLatitude + 1.0 / 120.0,
+            minimumLongitude: minimumLongitude,
+            maximumLongitude: minimumLongitude + 1.0 / 80.0
+        )
     }
 }
 
@@ -289,7 +460,8 @@ private final class GSIDEMXMLDelegate: NSObject, XMLParserDelegate {
                 srsName.isEmpty ? "記載なし" : srsName
             )
         }
-        guard sequenceOrder.isEmpty || sequenceOrder == "+x-y" else {
+        let normalizedSequenceOrder = Self.normalizedSequenceOrder(sequenceOrder)
+        guard sequenceOrder.isEmpty || normalizedSequenceOrder == "+x-y" else {
             throw ElevationDEMError.unsupportedSequence(sequenceOrder)
         }
         guard let lowerCorner,
@@ -481,6 +653,15 @@ private final class GSIDEMXMLDelegate: NSObject, XMLParserDelegate {
         let values = tokens.compactMap { Int($0) }
         return values.count == 2 ? values : nil
     }
+
+    private static func normalizedSequenceOrder(_ value: String) -> String {
+        value
+            .lowercased()
+            .replacingOccurrences(of: "−", with: "-")
+            .replacingOccurrences(of: "–", with: "-")
+            .replacingOccurrences(of: "—", with: "-")
+            .filter { !$0.isWhitespace }
+    }
 }
 
 private struct DEMZIPEntry {
@@ -495,7 +676,10 @@ private struct DEMZIPEntry {
 
 private struct DEMZIPArchive {
     private static let maximumEntries = 512
-    private static let maximumExpandedBytes = 192 * 1024 * 1024
+    // 現行の1m DEM ZIPは複数XMLを含み、圧縮後のファイルサイズより展開後が
+    // 大きくなる。1mの通常配布データを扱えるようにしつつ、異常な圧縮爆弾は
+    // 512MBで止める。
+    private static let maximumExpandedBytes = 512 * 1024 * 1024
     private static let crc32Table: [UInt32] = (0..<256).map { value in
         var crc = UInt32(value)
         for _ in 0..<8 {
@@ -512,6 +696,28 @@ private struct DEMZIPArchive {
     init(data: Data) throws {
         self.data = data
         self.entries = try Self.readCentralDirectory(data)
+    }
+
+    /// 実際に展開するエントリの合計サイズを検証する。
+    ///
+    /// 中央ディレクトリの読み取り時点では対象範囲をまだ判定していないため、
+    /// ZIP全体の合計サイズはここでは検査しない。各エントリの展開時にも
+    /// `inflate` で個別の上限を検証する。
+    func validateExpandedSize(of entries: [DEMZIPEntry]) throws {
+        var totalExpandedBytes = 0
+        for entry in entries {
+            guard entry.uncompressedSize >= 0,
+                  entry.uncompressedSize <= Self.maximumExpandedBytes else {
+                throw ElevationDEMError.archiveTooLarge
+            }
+            let (nextTotal, overflow) = totalExpandedBytes.addingReportingOverflow(
+                entry.uncompressedSize
+            )
+            guard !overflow, nextTotal <= Self.maximumExpandedBytes else {
+                throw ElevationDEMError.archiveTooLarge
+            }
+            totalExpandedBytes = nextTotal
+        }
     }
 
     func extract(_ entry: DEMZIPEntry) throws -> Data {
@@ -599,7 +805,6 @@ private struct DEMZIPArchive {
 
         var entries: [DEMZIPEntry] = []
         entries.reserveCapacity(entryCount)
-        var totalExpandedBytes = 0
         var pointer = Int(centralOffsetValue)
         let centralEnd = pointer + Int(centralSizeValue)
         guard pointer >= 0,
@@ -641,10 +846,6 @@ private struct DEMZIPArchive {
                 ?? String(data: nameData, encoding: .shiftJIS)
                 ?? ""
             let uncompressedSize = Int(uncompressedSizeValue)
-            totalExpandedBytes += uncompressedSize
-            guard totalExpandedBytes <= maximumExpandedBytes else {
-                throw ElevationDEMError.archiveTooLarge
-            }
             entries.append(
                 DEMZIPEntry(
                     name: name,
