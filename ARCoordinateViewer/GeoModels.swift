@@ -212,6 +212,11 @@ struct DisplaySettings: Codable, Equatable {
     var displayRadiusMeters: Double = 0
     var labelDistanceMeters: Double = 150
 
+    /// 点・線の個別設定を保ったまま、表示サイズを一括調整する倍率。
+    var masterSizeScale: Double = 1.0
+    /// 表示半径と点名表示距離を一括調整する倍率。
+    var masterRangeScale: Double = 1.0
+
     var arPointSize: Double = 0.05
     var arSelectedSphereSize: Double = 0.12
     var arLineWidth: Double = 0.01
@@ -258,6 +263,8 @@ struct DisplaySettings: Codable, Equatable {
         case maxLabelCount
         case displayRadiusMeters
         case labelDistanceMeters
+        case masterSizeScale
+        case masterRangeScale
         case arPointSize
         case arSelectedSphereSize
         case arLineWidth
@@ -289,6 +296,8 @@ struct DisplaySettings: Codable, Equatable {
         maxLabelCount = try container.decodeIfPresent(Int.self, forKey: .maxLabelCount) ?? maxLabelCount
         displayRadiusMeters = try container.decodeIfPresent(Double.self, forKey: .displayRadiusMeters) ?? displayRadiusMeters
         labelDistanceMeters = try container.decodeIfPresent(Double.self, forKey: .labelDistanceMeters) ?? labelDistanceMeters
+        masterSizeScale = try container.decodeIfPresent(Double.self, forKey: .masterSizeScale) ?? masterSizeScale
+        masterRangeScale = try container.decodeIfPresent(Double.self, forKey: .masterRangeScale) ?? masterRangeScale
         arPointSize = try container.decodeIfPresent(Double.self, forKey: .arPointSize) ?? arPointSize
         arSelectedSphereSize = try container.decodeIfPresent(Double.self, forKey: .arSelectedSphereSize) ?? arSelectedSphereSize
         arLineWidth = try container.decodeIfPresent(Double.self, forKey: .arLineWidth) ?? arLineWidth
@@ -313,6 +322,8 @@ struct DisplaySettings: Codable, Equatable {
         maxLabelCount = Swift.max(0, Swift.min(maxLabelCount, 500))
         displayRadiusMeters = Swift.max(0, Swift.min(displayRadiusMeters, 10000))
         labelDistanceMeters = Swift.max(0, Swift.min(labelDistanceMeters, 10000))
+        masterSizeScale = Swift.max(0.5, Swift.min(masterSizeScale, 3.0))
+        masterRangeScale = Swift.max(0.5, Swift.min(masterRangeScale, 3.0))
         arPointSize = Swift.max(0.005, Swift.min(arPointSize, 2.0))
         arSelectedSphereSize = Swift.max(0.01, Swift.min(arSelectedSphereSize, 3.0))
         arLineWidth = Swift.max(0.001, Swift.min(arLineWidth, 1.0))

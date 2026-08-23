@@ -81,6 +81,14 @@ struct ContentView: View {
 
     var body: some View {
         lifecycleObserversView
+            .overlay(alignment: .top) {
+                VStack(spacing: 8) {
+                    importProgressBanner
+                    importNoticeBanner
+                }
+                .padding(.top, 52)
+                    .zIndex(10)
+            }
     }
 
     // ContentViewには多数のsheet／onChangeがあるため、1本の巨大なView式にすると
@@ -893,6 +901,64 @@ struct ContentView: View {
         }
     }
 
+    @ViewBuilder
+    private var importProgressBanner: some View {
+        if model.isImporting {
+            VStack(alignment: .leading, spacing: 7) {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text(model.importProgressMessage.isEmpty ? "データを読み込み中…" : model.importProgressMessage)
+                        .font(.caption.weight(.semibold))
+                        .lineLimit(2)
+                }
+
+                if let progress = model.importProgress {
+                    ProgressView(value: progress)
+                        .tint(.accentColor)
+                }
+            }
+            .padding(.horizontal, 13)
+            .padding(.vertical, 10)
+            .frame(maxWidth: 330, alignment: .leading)
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+            .shadow(radius: 4, y: 2)
+            .padding(.horizontal, 16)
+            .transition(.move(edge: .top).combined(with: .opacity))
+        }
+    }
+
+    @ViewBuilder
+    private var importNoticeBanner: some View {
+        if let message = model.importNotice {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+
+                Text(message)
+                    .font(.caption.weight(.semibold))
+                    .lineLimit(4)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                Button {
+                    model.dismissImportNotice()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.caption.weight(.bold))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("メッセージを閉じる")
+            }
+            .padding(.horizontal, 13)
+            .padding(.vertical, 10)
+            .frame(maxWidth: 350, alignment: .leading)
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+            .shadow(radius: 4, y: 2)
+            .padding(.horizontal, 16)
+            .transition(.move(edge: .top).combined(with: .opacity))
+        }
+    }
+
     private func captureStatusPill(icon: String, text: String, tint: Color, showsProgress: Bool = false) -> some View {
         HStack(spacing: 7) {
             if showsProgress {
@@ -1701,6 +1767,10 @@ struct PlanMapSheet: View {
 
         drawRasters(context: context, projection: projection)
 
+        let masterSizeScale = model.settings.masterSizeScale
+        let planPointSize = model.settings.planPointSize * masterSizeScale
+        let planLineWidth = model.settings.planLineWidth * masterSizeScale
+
         for feature in model.planFeatures where feature.kind == .line || feature.kind == .polygon {
             let points = feature.coordinates.map { projection.point(for: $0) }
             guard points.count >= 2 else { continue }
@@ -1708,24 +1778,24 @@ struct PlanMapSheet: View {
             path.move(to: points[0])
             for point in points.dropFirst() { path.addLine(to: point) }
             if feature.kind == .polygon { path.closeSubpath() }
-            context.stroke(path, with: .color(.cyan.opacity(0.86)), lineWidth: CGFloat(model.settings.planLineWidth))
+            context.stroke(path, with: .color(.cyan.opacity(0.86)), lineWidth: CGFloat(planLineWidth))
         }
 
         for feature in model.planFeatures where feature.kind == .point {
             for coord in feature.coordinates {
-                drawPoint(coord, projection: projection, context: context, color: .yellow, size: model.settings.planPointSize)
+                drawPoint(coord, projection: projection, context: context, color: .yellow, size: planPointSize)
             }
         }
 
         // ライン・ポリゴンの頂点も選択しやすいよう小さく表示する。
         for feature in model.planFeatures where feature.kind != .point {
             for coord in feature.coordinates {
-                drawPoint(coord, projection: projection, context: context, color: .white.opacity(0.72), size: max(model.settings.planPointSize * 0.65, 3))
+                drawPoint(coord, projection: projection, context: context, color: .white.opacity(0.72), size: max(planPointSize * 0.65, 3 * masterSizeScale))
             }
         }
 
         if let selected = draftSelectedPoint ?? model.selectedPoint {
-            drawPoint(selected, projection: projection, context: context, color: .red, size: model.settings.planPointSize * 1.9)
+            drawPoint(selected, projection: projection, context: context, color: .red, size: planPointSize * 1.9)
             let p = projection.point(for: selected)
             context.draw(Text(selected.name ?? "選択点").font(.caption2.bold()).foregroundColor(.white), at: CGPoint(x: p.x + 8, y: p.y - 10), anchor: .leading)
         }
@@ -1784,7 +1854,7 @@ struct PlanMapSheet: View {
         }
         guard let nearest else { return }
         let p = projection.point(for: nearest)
-        let threshold = CGFloat(max(28.0, model.settings.planPointSize * 2.4))
+        let threshold = CGFloat(max(28.0 * model.settings.masterSizeScale, model.settings.planPointSize * 2.4 * model.settings.masterSizeScale))
         if hypot(p.x - location.x, p.y - location.y) <= threshold {
             draftSelectedPoint = nearest
         } else if model.rastersEnabled, isInsideAnyRaster(location, projection: projection) {
@@ -1986,6 +2056,18 @@ struct DisplaySettingsSheet: View {
 
     @ViewBuilder
     private var detailedSettings: some View {
+        Section("マスター調整") {
+            sliderRow(title: "表示サイズ倍率", value: $model.settings.masterSizeScale, range: 0.5...3.0, step: 0.05, unit: "倍")
+            Text("点・線・選択点・遠方表示・平面図のサイズへまとめて反映します。下の個別設定は相対関係を保ったまま微調整できます。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            sliderRow(title: "表示範囲倍率", value: $model.settings.masterRangeScale, range: 0.5...3.0, step: 0.05, unit: "倍")
+            Text("表示半径と点名表示距離へ反映します。「制限なし」の設定はそのままです。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+
         Section("詳細：表示範囲と件数") {
             Stepper("最大表示ポイント数：\(model.settings.maxDisplayPoints)", value: $model.settings.maxDisplayPoints, in: 0...10000, step: 50)
             Stepper("最大表示線分数：\(model.settings.maxDisplayLines)", value: $model.settings.maxDisplayLines, in: 0...5000, step: 25)

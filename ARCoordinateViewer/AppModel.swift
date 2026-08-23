@@ -60,6 +60,10 @@ final class AppModel: ObservableObject {
     @Published var rasters: [GeoRaster] = []
     @Published var elevationGrids: [ElevationGrid] = []
     @Published var statusMessage: String = "KML / KMZ / CSV / SIMA / GeoTIFF / DEMを読み込んでください。"
+    @Published private(set) var isImporting = false
+    @Published private(set) var importProgress: Double?
+    @Published private(set) var importProgressMessage = ""
+    @Published private(set) var importNotice: String?
     @Published var arStatusMessage: String = "AR準備中"
     @Published var planeSystemNumber: Int = 9
     @Published var settings: DisplaySettings = DisplaySettings.defaults {
@@ -132,6 +136,7 @@ final class AppModel: ObservableObject {
     private var altitudeGridOrigin: GeoCoordinate?
     private var altitudeGrid: [AltitudeGridKey: [Int]] = [:]
     private var altitudeBaselineCache: Double?
+    private var importOperationID = 0
     private var activePhotoCaptureRequestID: Int?
     private var hasPendingPhotoCaptureRequest = false
     private var photoCaptureTimeoutTask: Task<Void, Never>?
@@ -146,6 +151,46 @@ final class AppModel: ObservableObject {
         settings = Self.loadSettings(key: settingsKey)
     }
 
+    @discardableResult
+    private func beginImportProgress(_ message: String) -> Int {
+        importOperationID &+= 1
+        isImporting = true
+        importProgress = nil
+        importProgressMessage = message
+        importNotice = nil
+        statusMessage = message
+        return importOperationID
+    }
+
+    func dismissImportNotice() {
+        importNotice = nil
+    }
+
+    private func showImportNotice(_ message: String) {
+        importNotice = message
+    }
+
+    private func updateImportProgress(
+        _ progress: Double?,
+        message: String,
+        operationID: Int
+    ) {
+        guard operationID == importOperationID else { return }
+        if let progress, progress.isFinite {
+            importProgress = max(0, min(1, progress))
+        } else {
+            importProgress = nil
+        }
+        importProgressMessage = message
+    }
+
+    private func finishImportProgress(operationID: Int) {
+        guard operationID == importOperationID else { return }
+        isImporting = false
+        importProgress = nil
+        importProgressMessage = ""
+    }
+
     func importFile(url: URL) {
         importFileAsync(url: url)
     }
@@ -153,7 +198,20 @@ final class AppModel: ObservableObject {
     func importFileAsync(url: URL) {
         let fileName = url.lastPathComponent
         let planeSystem = planeSystemNumber
-        statusMessage = "読込中：\(fileName)"
+        let ext = url.pathExtension.lowercased()
+        let targetRegion: DEMImportRegion?
+        if ext == "xml" || ext == "zip" {
+            guard let region = currentDEMImportRegion() else {
+                let message = "DEMを読み込む前に、先に点・線などの対象データを読み込んでください。\n対象データの範囲に絞ってDEMを読み込みます。"
+                statusMessage = message
+                showImportNotice(message)
+                return
+            }
+            targetRegion = region
+        } else {
+            targetRegion = nil
+        }
+        let operationID = beginImportProgress("読込中：\(fileName)")
 
         DispatchQueue.global(qos: .userInitiated).async {
             let started = url.startAccessingSecurityScopedResource()
@@ -163,8 +221,15 @@ final class AppModel: ObservableObject {
 
             do {
                 let data = try Data(contentsOf: url)
-                let ext = url.pathExtension.lowercased()
                 let result: ParsedImportResult
+
+                Task { @MainActor [weak self] in
+                    self?.updateImportProgress(
+                        nil,
+                        message: "\(fileName)を解析中…",
+                        operationID: operationID
+                    )
+                }
 
                 if ext == "xml" {
                     let grid = try GSIElevationDEMParser.parseXML(data: data, fileName: fileName)
@@ -182,7 +247,20 @@ final class AppModel: ObservableObject {
                         enableRasters: false
                     )
                 } else if ext == "zip" {
-                    let grids = try GSIElevationDEMParser.parseZIP(data: data, fileName: fileName)
+                    let grids = try GSIElevationDEMParser.parseZIP(
+                        data: data,
+                        fileName: fileName,
+                        targetRegion: targetRegion,
+                        progress: { [weak self] progress, message in
+                            Task { @MainActor [weak self] in
+                                self?.updateImportProgress(
+                                    progress,
+                                    message: message,
+                                    operationID: operationID
+                                )
+                            }
+                        }
+                    )
                     result = ParsedImportResult(
                         name: fileName,
                         features: [],
@@ -266,10 +344,14 @@ final class AppModel: ObservableObject {
 
                 Task { @MainActor in
                     self.applyParsedImport(result)
+                    self.finishImportProgress(operationID: operationID)
                 }
             } catch {
                 Task { @MainActor in
-                    self.statusMessage = "読込エラー：\(error.localizedDescription)"
+                    let message = "読込エラー：\(error.localizedDescription)"
+                    self.statusMessage = message
+                    self.showImportNotice(message)
+                    self.finishImportProgress(operationID: operationID)
                 }
             }
         }
@@ -333,6 +415,34 @@ final class AppModel: ObservableObject {
         )
         selectedPoint = nil
         rebuildVisibleData()
+    }
+
+    /// 表示中の点・線・画地を含むDEM読込対象範囲を作る。
+    /// 1m DEMタイルの端部にあるデータと、線の地形追従用サンプルを取りこぼさないよう、
+    /// 外周へ100mの余裕を加える。
+    private func currentDEMImportRegion() -> DEMImportRegion? {
+        let coordinates = features.flatMap { $0.coordinates } + importedPointList
+        let validCoordinates = coordinates.filter {
+            $0.latitude.isFinite && $0.longitude.isFinite
+        }
+        guard let first = validCoordinates.first else { return nil }
+
+        var minimumLatitude = first.latitude
+        var maximumLatitude = first.latitude
+        var minimumLongitude = first.longitude
+        var maximumLongitude = first.longitude
+        for coordinate in validCoordinates.dropFirst() {
+            minimumLatitude = min(minimumLatitude, coordinate.latitude)
+            maximumLatitude = max(maximumLatitude, coordinate.latitude)
+            minimumLongitude = min(minimumLongitude, coordinate.longitude)
+            maximumLongitude = max(maximumLongitude, coordinate.longitude)
+        }
+        return DEMImportRegion(
+            minimumLatitude: minimumLatitude,
+            maximumLatitude: maximumLatitude,
+            minimumLongitude: minimumLongitude,
+            maximumLongitude: maximumLongitude
+        ).expanded(by: 100)
     }
 
     /// 高さ補完はAR表示中に行わず、読み込み時に一度だけ行う。
@@ -840,7 +950,7 @@ final class AppModel: ObservableObject {
     func importCSVAsync(text: String, fileName: String, mapping: CSVColumnMapping) {
         var safeMapping = mapping
         safeMapping.planeSystemNumber = Swift.max(1, Swift.min(safeMapping.planeSystemNumber, 19))
-        statusMessage = "CSV読込中：\(fileName)"
+        let operationID = beginImportProgress("CSV読込中：\(fileName)")
 
         DispatchQueue.global(qos: .userInitiated).async {
             do {
@@ -857,10 +967,12 @@ final class AppModel: ObservableObject {
                 )
                 Task { @MainActor in
                     self.applyParsedImport(result)
+                    self.finishImportProgress(operationID: operationID)
                 }
             } catch {
                 Task { @MainActor in
                     self.statusMessage = "CSV読込エラー：\(error.localizedDescription)"
+                    self.finishImportProgress(operationID: operationID)
                 }
             }
         }
@@ -871,7 +983,7 @@ final class AppModel: ObservableObject {
     }
 
     func importGeoTIFFAsync(data: Data, fileName: String, coordinateMode: GeoTIFFCoordinateMode) {
-        statusMessage = "GeoTIFF読込中：\(fileName)"
+        let operationID = beginImportProgress("GeoTIFF読込中：\(fileName)")
 
         DispatchQueue.global(qos: .userInitiated).async {
             do {
@@ -894,10 +1006,12 @@ final class AppModel: ObservableObject {
                 )
                 Task { @MainActor in
                     self.applyParsedImport(result)
+                    self.finishImportProgress(operationID: operationID)
                 }
             } catch {
                 Task { @MainActor in
                     self.statusMessage = "GeoTIFF読込エラー：\(error.localizedDescription)"
+                    self.finishImportProgress(operationID: operationID)
                 }
             }
         }
@@ -908,7 +1022,7 @@ final class AppModel: ObservableObject {
         fileName: String,
         coordinateMode: GeoTIFFCoordinateMode
     ) {
-        statusMessage = "標高GeoTIFF読込中：\(fileName)"
+        let operationID = beginImportProgress("標高GeoTIFF読込中：\(fileName)")
 
         DispatchQueue.global(qos: .userInitiated).async {
             do {
@@ -938,10 +1052,12 @@ final class AppModel: ObservableObject {
                 )
                 Task { @MainActor in
                     self.applyParsedImport(result)
+                    self.finishImportProgress(operationID: operationID)
                 }
             } catch {
                 Task { @MainActor in
                     self.statusMessage = "標高GeoTIFF読込エラー：\(error.localizedDescription)"
+                    self.finishImportProgress(operationID: operationID)
                 }
             }
         }
@@ -1010,15 +1126,26 @@ final class AppModel: ObservableObject {
     }
 
     var renderStyle: RenderStyle {
-        RenderStyle(
-            pointRadius: Float(settings.arPointSize),
-            selectedPointRadius: Float(settings.arSelectedSphereSize),
-            lineRadius: Float(settings.arLineWidth),
+        let sizeScale = settings.masterSizeScale
+        return RenderStyle(
+            pointRadius: Float(settings.arPointSize * sizeScale),
+            selectedPointRadius: Float(settings.arSelectedSphereSize * sizeScale),
+            lineRadius: Float(settings.arLineWidth * sizeScale),
             farMinimumSizeEnabled: settings.farMinimumSizeEnabled,
-            farPointMinRadius: Float(settings.farPointMinSize),
-            farLineMinRadius: Float(settings.farLineMinWidth),
+            farPointMinRadius: Float(settings.farPointMinSize * sizeScale),
+            farLineMinRadius: Float(settings.farLineMinWidth * sizeScale),
             rasterOpacity: Float(settings.rasterOpacity)
         )
+    }
+
+    private var effectiveDisplayRadiusMeters: Double {
+        guard settings.displayRadiusMeters > 0 else { return 0 }
+        return settings.displayRadiusMeters * settings.masterRangeScale
+    }
+
+    private var effectiveLabelDistanceMeters: Double {
+        guard settings.labelDistanceMeters > 0 else { return 0 }
+        return settings.labelDistanceMeters * settings.masterRangeScale
     }
 
 
@@ -1059,8 +1186,8 @@ final class AppModel: ObservableObject {
             "sel=\(selectedPoint?.id.uuidString ?? "no-selected")",
             "alt=\(settings.useRelativeAltitude)-\(settings.relativeAltitudeLimitMeters)",
             "dem=\(elevationGrids.map { $0.id.uuidString }.joined(separator: ","))-\(settings.boundaryTerrainFollowEnabled)-\(settings.demSampleSpacingMeters)",
-            "labels=\(settings.showLabels)-\(settings.maxLabelCount)-\(settings.labelDistanceMeters)",
-            "size=\(settings.arPointSize)-\(settings.arSelectedSphereSize)-\(settings.arLineWidth)-auto\(settings.farMinimumSizeEnabled)-\(settings.farPointMinSize)-\(settings.farLineMinWidth)",
+            "labels=\(settings.showLabels)-\(settings.maxLabelCount)-\(settings.labelDistanceMeters)-master\(settings.masterRangeScale)",
+            "size=\(settings.arPointSize)-\(settings.arSelectedSphereSize)-\(settings.arLineWidth)-master\(settings.masterSizeScale)-auto\(settings.farMinimumSizeEnabled)-\(settings.farPointMinSize)-\(settings.farLineMinWidth)",
             "limit=\(limit.pointCount)-\(limit.lineCount)-pLabel\(limit.parcelLabelFeatures.count)"
         ].joined(separator: "|")
     }
@@ -1091,8 +1218,8 @@ final class AppModel: ObservableObject {
         selectedPosition: SIMD3<Float>?,
         altitudeBaseline: Double?
     ) -> [RenderLabel] {
-        let parcelLabelOffset = Float(max(settings.arLineWidth * 2.0 + 0.03, 0.04))
         let style = renderStyle
+        let parcelLabelOffset = Float(max(style.lineRadius * 2.0 + 0.03, 0.04))
         let selectedDistance = selectedPosition.map { horizontalDistance($0) } ?? 0
         let selectedRadius = style.effectivePointRadius(distance: selectedDistance, baseRadius: style.selectedPointRadius)
         let selectedLabelOffset = max(0.05 + selectedRadius * 1.15 + 0.035, 0.075)
@@ -1110,7 +1237,7 @@ final class AppModel: ObservableObject {
         for feature in renderFeatures where feature.kind == .point {
             for position in feature.positions {
                 let distance = horizontalDistance(position)
-                if settings.labelDistanceMeters <= 0 || Double(distance) <= settings.labelDistanceMeters {
+                if effectiveLabelDistanceMeters <= 0 || Double(distance) <= effectiveLabelDistanceMeters {
                     let visibleRadius = style.effectivePointRadius(distance: distance)
                     let pointLabelOffset = max(visibleRadius * 1.15 + 0.025, 0.035)
                     labels.append(RenderLabel(id: UUID(), text: feature.name, position: position + SIMD3<Float>(0, pointLabelOffset, 0), distance: distance, labelRole: .point, screenYOffset: 10))
@@ -1142,7 +1269,7 @@ final class AppModel: ObservableObject {
                     }()
                 )
                 let distance = horizontalDistance(position)
-                if settings.labelDistanceMeters <= 0 || Double(distance) <= settings.labelDistanceMeters {
+                if effectiveLabelDistanceMeters <= 0 || Double(distance) <= effectiveLabelDistanceMeters {
                     labels.append(RenderLabel(id: feature.id, text: feature.name, position: position + SIMD3<Float>(0, parcelLabelOffset, 0), distance: distance, labelRole: .parcel, screenYOffset: 0))
                 }
             }
@@ -1528,6 +1655,12 @@ final class AppModel: ObservableObject {
                 $0 * spacingMultiplier
             }
             let shouldFollowTerrain = terrainSpacing != nil
+            // 境界線だけを細分化する処理とは別に、点は元の頂点位置のまま
+            // DEMを補間すればよい。従来はこの分岐が線にしか存在せず、
+            // 「高さ情報を使う」がONでも点だけ元データの高度に留まっていた。
+            let shouldSamplePointTerrain = feature.kind == .point
+                && settings.useRelativeAltitude
+                && settings.boundaryTerrainFollowEnabled
 
             let coordinates: [GeoCoordinate]
             if let terrainSpacing {
@@ -1545,7 +1678,7 @@ final class AppModel: ObservableObject {
 
             let positions: [SIMD3<Float>] = coordinates.map { coord in
                 let verticalOffset: Double
-                if shouldFollowTerrain,
+                if (shouldFollowTerrain || shouldSamplePointTerrain),
                    let terrainElevation = sampledDEMElevation(at: coord) {
                     verticalOffset = relativeHeightMeters(
                         elevation: terrainElevation,
@@ -1707,7 +1840,7 @@ final class AppModel: ObservableObject {
 
         let pointText = "点\(selectedPointsUsed)/\(totalPointCount)"
         let lineText = "線\(lineSegments.count)/\(totalLineCount)"
-        let radiusText = settings.displayRadiusMeters > 0 ? " / 半径\(Int(settings.displayRadiusMeters))m" : ""
+        let radiusText = effectiveDisplayRadiusMeters > 0 ? " / 半径\(Int(effectiveDisplayRadiusMeters))m" : ""
         let message = "表示：\(pointText)・\(lineText)\(radiusText)"
         return DisplayLimitResult(features: output, parcelLabelFeatures: parcelLabelFeatures, message: message, pointCount: selectedPointsUsed, lineCount: lineSegments.count, totalPointCount: totalPointCount, totalLineCount: totalLineCount)
     }
@@ -1821,11 +1954,11 @@ final class AppModel: ObservableObject {
     }
 
     private func filterByRadius(_ source: [GeoFeature]) -> [GeoFeature] {
-        guard settings.displayRadiusMeters > 0, let origin else { return source }
+        guard effectiveDisplayRadiusMeters > 0, let origin else { return source }
         return source.compactMap { feature in
             let coords = feature.coordinates.filter { coordinate in
                 let meters = CoordinateConverter.enuMeters(from: coordinate, origin: origin)
-                return hypot(meters.east, meters.north) <= settings.displayRadiusMeters
+                return hypot(meters.east, meters.north) <= effectiveDisplayRadiusMeters
             }
             if coords.isEmpty { return nil }
             switch feature.kind {
@@ -1906,11 +2039,11 @@ final class AppModel: ObservableObject {
     private func appendLineSegment(name: String, labelRole: GeoFeatureLabelRole, a: GeoCoordinate, b: GeoCoordinate, order: inout Int, into segments: inout [(order: Int, feature: GeoFeature, nearest: Double)]) {
         defer { order += 1 }
 
-        if settings.displayRadiusMeters > 0, let origin {
+        if effectiveDisplayRadiusMeters > 0, let origin {
             let da = CoordinateConverter.enuMeters(from: a, origin: origin)
             let db = CoordinateConverter.enuMeters(from: b, origin: origin)
             let nearest = min(hypot(da.east, da.north), hypot(db.east, db.north))
-            guard nearest <= settings.displayRadiusMeters else { return }
+            guard nearest <= effectiveDisplayRadiusMeters else { return }
             let feature = GeoFeature(name: name, kind: .line, coordinates: [a, b], labelRole: labelRole)
             segments.append((order, feature, nearest))
         } else {
@@ -1939,8 +2072,8 @@ final class AppModel: ObservableObject {
             "sel=\(selectedText)",
             "p=\(settings.showPoints)-\(settings.maxDisplayPoints)",
             "l=\(settings.showLines)-\(settings.maxDisplayLines)",
-            "r=\(settings.displayRadiusMeters)",
-            "n=\(settings.showLabels)-\(settings.maxLabelCount)-\(settings.labelDistanceMeters)"
+            "r=\(settings.displayRadiusMeters)-master\(settings.masterRangeScale)",
+            "n=\(settings.showLabels)-\(settings.maxLabelCount)-\(settings.labelDistanceMeters)-master\(settings.masterRangeScale)"
         ].joined(separator: "|")
     }
 
