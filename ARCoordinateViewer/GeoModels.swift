@@ -2,18 +2,99 @@ import Foundation
 import simd
 import UIKit
 
-struct GeoCoordinate: Identifiable, Hashable {
-    let id = UUID()
+struct GeoCoordinate: Identifiable, Hashable, Codable {
+    var id = UUID()
     var name: String?
     var latitude: Double
     var longitude: Double
     var altitude: Double?
+    /// Original DXF Z in metres, including an explicit/implicit zero in a 2D file.
+    var dxfAltitude: Double? = nil
+    var altitudeWasEstimated: Bool? = nil
+    var drawingSourceAltitude: Double? { dxfAltitude ?? (altitudeWasEstimated == true ? nil : altitude) }
+    var planeSystem: Int? = nil
+    var planeNorth: Double? = nil
+    var planeEast: Double? = nil
 
     init(name: String? = nil, latitude: Double, longitude: Double, altitude: Double? = nil) {
         self.name = name
         self.latitude = latitude
         self.longitude = longitude
         self.altitude = altitude
+    }
+}
+
+struct DXFCoordinateReference: Codable, Hashable {
+    var planeSystem = 9
+    var metersPerUnit = 1.0
+    var xIsEasting = true
+    var insertionUnits: Int? = nil
+}
+
+enum PhotoCaptureMode:String,Codable,CaseIterable { case arOverlay, cameraOnly
+    var title:String { self == .arOverlay ? "AR写真" : "写真のみ" }
+}
+enum PhotoPositionSource:String,Codable { case ar, deviceGPS }
+enum SurveyDatum:String,Codable,CaseIterable { case unknown, wgs84, jgd2011, jgd2000
+    var title:String { switch self { case .unknown:return "不明・任意座標";case .wgs84:return "WGS84";case .jgd2011:return "JGD2011";case .jgd2000:return "JGD2000" } }
+}
+enum SurveyHeightReference:String,Codable,CaseIterable { case unknown, seaLevel, ellipsoid, local
+    var title:String { switch self { case .unknown:return "不明";case .seaLevel:return "海面基準の標高（T.P.等）";case .ellipsoid:return "楕円体高";case .local:return "任意の高さ" } }
+}
+struct PhotoReferenceSettings:Codable,Equatable {
+    var datum:SurveyDatum = .unknown
+    var heightReference:SurveyHeightReference = .unknown
+}
+
+enum DrawingExportHeightMode: String, Codable { case automatic, planar, referencePoint }
+struct DrawingExportProfile: Codable, Equatable {
+    var planeSystem = 0
+    var metresPerUnit: Double?
+    var xIsEasting: Bool?
+    var insertionUnits: Int?
+    var heightMode = DrawingExportHeightMode.automatic
+    var anchorID: UUID?
+    var anchorAltitude: Double?
+    var reference: DXFCoordinateReference? {
+        guard (1...19).contains(planeSystem), let metresPerUnit, metresPerUnit.isFinite,
+              metresPerUnit > 0, let xIsEasting else { return nil }
+        return DXFCoordinateReference(planeSystem:planeSystem,metersPerUnit:metresPerUnit,xIsEasting:xIsEasting,insertionUnits:insertionUnits)
+    }
+    init(reference: DXFCoordinateReference? = nil) {
+        if let reference {
+            planeSystem=reference.planeSystem; metresPerUnit=reference.metersPerUnit
+            xIsEasting=reference.xIsEasting; insertionUnits=reference.insertionUnits
+        }
+    }
+}
+
+/// Source file RGBA, independent of display frameworks.
+struct SourceColor: Hashable, Codable {
+    var red: Double
+    var green: Double
+    var blue: Double
+    var alpha: Double = 1
+
+    static func rgb(_ value: Int) -> SourceColor {
+        SourceColor(red: Double((value >> 16) & 255)/255, green: Double((value >> 8) & 255)/255, blue: Double(value & 255)/255)
+    }
+    static func kml(_ text: String) -> SourceColor? {
+        guard text.count == 8, let value = UInt32(text, radix:16) else { return nil }
+        return SourceColor(red: Double(value & 255)/255, green: Double((value >> 8) & 255)/255,
+                           blue: Double((value >> 16) & 255)/255, alpha: Double(value >> 24)/255)
+    }
+    static func aci(_ index: Int) -> SourceColor? {
+        guard (1...255).contains(index) else { return nil }
+        let basic = [0,0xff0000,0xffff00,0x00ff00,0x00ffff,0x0000ff,0xff00ff,0xffffff,0x808080,0xc0c0c0]
+        if index < 10 { return rgb(basic[index]) }
+        if index >= 250 { let v = [51,80,105,130,190,255][index-250]; return rgb(v*0x010101) }
+        let hue = Double((index-10)/10)/4
+        let value = [255.0,165,127,76,38][((index-10)%10)/2]
+        let saturation = index % 2 == 0 ? 1.0 : 0.5
+        let c = value*saturation, x = c*(1-abs(hue.truncatingRemainder(dividingBy:2)-1)), m = value-c
+        let components: (Double,Double,Double)
+        switch Int(hue) { case 0: components=(c,x,0); case 1: components=(x,c,0); case 2: components=(0,c,x); case 3: components=(0,x,c); case 4: components=(x,0,c); default: components=(c,0,x) }
+        return SourceColor(red: floor(components.0+m)/255,green: floor(components.1+m)/255,blue: floor(components.2+m)/255)
     }
 }
 
@@ -29,14 +110,17 @@ enum GeoFeatureLabelRole: String, Codable, Hashable {
     case parcel
 }
 
-struct GeoFeature: Identifiable, Hashable {
-    let id = UUID()
+struct GeoFeature: Identifiable, Hashable, Codable {
+    var id = UUID()
     var name: String
     var kind: GeometryKind
     var coordinates: [GeoCoordinate]
     var labelRole: GeoFeatureLabelRole
+    var sourceLayer: String? = nil
+    var sourceColor: SourceColor? = nil
 
-    init(name: String, kind: GeometryKind, coordinates: [GeoCoordinate], labelRole: GeoFeatureLabelRole? = nil) {
+    init(name: String, kind: GeometryKind, coordinates: [GeoCoordinate], labelRole: GeoFeatureLabelRole? = nil, sourceColor: SourceColor? = nil) {
+        self.sourceColor = sourceColor
         self.name = name
         self.kind = kind
         self.coordinates = coordinates
@@ -53,10 +137,18 @@ struct RenderFeature: Identifiable, Hashable {
     /// 地形追従のために線を細分化した場合でも、柱は元の境界点だけへ立てる。
     /// nilの場合は従来どおり全positionsを使う。
     var pillarPositions: [SIMD3<Float>]? = nil
+    var sourceColor: SourceColor? = nil
+    /// Original drawing heights stay separate from flattened/clipped/DEM display Y.
+    var sourceAltitudes: [Double?]? = nil
+    var pillarSourceAltitudes: [Double?]? = nil
+}
+
+extension SourceColor {
+    var uiColor: UIColor { UIColor(red: red, green: green, blue: blue, alpha: alpha) }
 }
 
 struct GeoRaster: Identifiable {
-    let id = UUID()
+    var id = UUID()
     var name: String
     var image: UIImage
     /// top-left, top-right, bottom-right, bottom-left の順
@@ -66,11 +158,14 @@ struct GeoRaster: Identifiable {
     var renderedPixelWidth: Int
     var renderedPixelHeight: Int
     var notes: String
+    var tileStore: RasterTileStore? = nil
 }
 
 
 struct ImportedDataLayer: Identifiable {
-    let id = UUID()
+    var dxfReference: DXFCoordinateReference? = nil
+    var documentID: UUID
+    var id = UUID()
     var name: String
     var features: [GeoFeature]
     var points: [GeoCoordinate]
@@ -82,16 +177,26 @@ struct ImportedDataLayer: Identifiable {
         points.count
     }
 
-    var lineCount: Int {
-        features.reduce(0) { total, feature in
-            switch feature.kind {
-            case .point:
-                return total
-            case .line:
-                return total + max(0, feature.coordinates.count - 1)
-            case .polygon:
-                return total + max(0, feature.coordinates.count)
-            }
+    let lineCount: Int
+    let constantDXFAltitude: Double?
+
+    init(name: String, features: [GeoFeature], points: [GeoCoordinate], rasters: [GeoRaster], elevationGrids: [ElevationGrid] = [], isVisible: Bool = true, dxfReference: DXFCoordinateReference? = nil, documentID: UUID = UUID()) {
+        self.documentID = documentID
+        self.dxfReference = dxfReference
+        self.name = name; self.features = features; self.points = points; self.rasters = rasters
+        self.elevationGrids = elevationGrids; self.isVisible = isVisible
+        var constant: Double?
+        if dxfReference != nil {
+            heightScan: for feature in features { for coordinate in feature.coordinates {
+                let height=coordinate.drawingSourceAltitude ?? 0
+                guard height.isFinite else { constant=nil; break heightScan }
+                if let first=constant, first != height { constant=nil; break heightScan }
+                constant=height
+            } }
+        }
+        constantDXFAltitude=constant
+        lineCount = features.reduce(0) { sum, feature in
+            sum + (feature.kind == .point ? 0 : max(0, feature.coordinates.count-1) + (feature.kind == .polygon ? 1 : 0))
         }
     }
 
@@ -175,6 +280,8 @@ struct ScreenLabel: Identifiable, Hashable {
     var screenYOffset: CGFloat = 20
     /// LiDAR深度判定による表示倍率。通常は1.0、現実物体の奥側では設定値まで下げる。
     var opacity: Double = 1.0
+    /// Tree identity and measured diameter occupy two lines; other labels stay compact.
+    var maximumLines: Int = 1
 }
 
 struct RenderLabel: Identifiable, Hashable {
@@ -209,7 +316,7 @@ struct DisplaySettings: Codable, Equatable {
     var maxLabelCount: Int = 30
 
     /// 0以下は距離制限なし
-    var displayRadiusMeters: Double = 0
+    var displayRadiusMeters: Double = 1000
     var labelDistanceMeters: Double = 150
 
     /// 点・線の個別設定を保ったまま、表示サイズを一括調整する倍率。
@@ -230,11 +337,13 @@ struct DisplaySettings: Codable, Equatable {
     var farLineMinWidth: Double = 0.01
 
     /// 森林・草地でARKit方位だけがずれた場合、コンパスを補助基準に緩やかに補正する。
-    var headingStabilizationEnabled: Bool = true
+    var headingStabilizationEnabled: Bool = false
+    var headingStabilizationExplicit: Bool? = nil
 
     /// LiDAR深度から、現実物体より奥側にあるAR要素を半透明にする。
     var lidarFadeBehindObjectsEnabled: Bool = true
-    var lidarBehindOpacity: Double = 0.28
+    var lidarBehindOpacity: Double = 0.50
+    var drawingDistanceMode: DrawingDistanceMode = .slope
 
     /// 取り込んだ標高を、現在地付近の標高を基準にした高さ差としてAR表示する。
     /// 標高0や欠損高度は軽量な近傍推定で補完する。
@@ -274,8 +383,10 @@ struct DisplaySettings: Codable, Equatable {
         case farPointMinSize
         case farLineMinWidth
         case headingStabilizationEnabled
+        case headingStabilizationExplicit
         case lidarFadeBehindObjectsEnabled
         case lidarBehindOpacity
+        case drawingDistanceMode
         case useRelativeAltitude
         case relativeAltitudeLimitMeters
         case boundaryTerrainFollowEnabled
@@ -307,8 +418,11 @@ struct DisplaySettings: Codable, Equatable {
         farPointMinSize = try container.decodeIfPresent(Double.self, forKey: .farPointMinSize) ?? farPointMinSize
         farLineMinWidth = try container.decodeIfPresent(Double.self, forKey: .farLineMinWidth) ?? farLineMinWidth
         headingStabilizationEnabled = try container.decodeIfPresent(Bool.self, forKey: .headingStabilizationEnabled) ?? headingStabilizationEnabled
+        headingStabilizationExplicit = try container.decodeIfPresent(Bool.self, forKey: .headingStabilizationExplicit)
         lidarFadeBehindObjectsEnabled = try container.decodeIfPresent(Bool.self, forKey: .lidarFadeBehindObjectsEnabled) ?? lidarFadeBehindObjectsEnabled
         lidarBehindOpacity = try container.decodeIfPresent(Double.self, forKey: .lidarBehindOpacity) ?? lidarBehindOpacity
+        drawingDistanceMode = (try container.decodeIfPresent(String.self, forKey: .drawingDistanceMode))
+            .flatMap(DrawingDistanceMode.init(rawValue:)) ?? .slope
         useRelativeAltitude = try container.decodeIfPresent(Bool.self, forKey: .useRelativeAltitude) ?? useRelativeAltitude
         relativeAltitudeLimitMeters = try container.decodeIfPresent(Double.self, forKey: .relativeAltitudeLimitMeters) ?? relativeAltitudeLimitMeters
         boundaryTerrainFollowEnabled = try container.decodeIfPresent(Bool.self, forKey: .boundaryTerrainFollowEnabled) ?? boundaryTerrainFollowEnabled

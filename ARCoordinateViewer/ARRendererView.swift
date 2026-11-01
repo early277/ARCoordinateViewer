@@ -4,6 +4,7 @@ import ARKit
 import AVFoundation
 import Photos
 import UIKit
+import ImageIO
 
 private struct HeadingStabilizationInput: Equatable {
     var enabled: Bool
@@ -29,9 +30,9 @@ private final class ARRendererUIBridge {
 
     @MainActor
     func updateLiDARSupport(_ supported: Bool, disableRequestedSetting: Bool) {
-        model?.lidarSupported = supported
+        if model?.lidarSupported != supported { model?.lidarSupported = supported }
         if disableRequestedSetting {
-            model?.lidarEnabled = false
+            if model?.lidarEnabled == true { model?.lidarEnabled = false }
         }
     }
 
@@ -56,14 +57,42 @@ private final class ARRendererUIBridge {
     }
 
     @MainActor
-    func photoCaptureSucceeded(_ requestID: Int) {
-        model?.photoCaptureSucceeded(requestID: requestID)
+    func photoCaptureSucceeded(_ requestID: Int, message:String) {
+        model?.photoCaptureSucceeded(requestID: requestID,message:message)
     }
 
     @MainActor
     func photoCaptureFailed(_ requestID: Int, message: String) {
         model?.photoCaptureFailed(requestID: requestID, message: message)
     }
+}
+
+private final class DrawingTapRecognizer: UIGestureRecognizer {
+    private var startPoint = CGPoint.zero
+    private var lastPoint = CGPoint.zero
+    private var startTime: TimeInterval = 0
+    private var travel = 0.0
+    private var trackingTouch:UITouch?
+    override func touchesBegan(_ touches:Set<UITouch>, with event:UIEvent) {
+        guard trackingTouch == nil, touches.count == 1, let touch=touches.first, state == .possible else { state = .failed; return }
+        trackingTouch=touch
+        startPoint=touch.location(in:view); lastPoint=startPoint; startTime=touch.timestamp; travel=0
+    }
+    override func touchesMoved(_ touches:Set<UITouch>, with event:UIEvent) {
+        guard let touch=touches.first else { return }
+        lastPoint=touch.location(in:view)
+        travel=max(travel,Double(hypot(lastPoint.x-startPoint.x,lastPoint.y-startPoint.y)))
+        if travel > DrawingTapPolicy.maxTravel { state = .failed }
+    }
+    override func touchesEnded(_ touches:Set<UITouch>, with event:UIEvent) {
+        guard state == .possible, let touch=touches.first else { return }
+        lastPoint=touch.location(in:view)
+        travel=max(travel,Double(hypot(lastPoint.x-startPoint.x,lastPoint.y-startPoint.y)))
+        state=DrawingTapPolicy.accepts(travel:travel,duration:touch.timestamp-startTime) ? .recognized : .failed
+    }
+    override func touchesCancelled(_ touches:Set<UITouch>, with event:UIEvent) { state = .cancelled }
+    override func location(in target:UIView?) -> CGPoint { view?.convert(lastPoint,to:target) ?? lastPoint }
+    override func reset() { super.reset(); trackingTouch=nil; travel=0; startTime=0 }
 }
 
 struct ARRendererView: UIViewRepresentable {
@@ -88,6 +117,12 @@ struct ARRendererView: UIViewRepresentable {
         arView.session.delegateQueue = .main
         arView.session.delegate = context.coordinator
         context.coordinator.arView = arView
+        context.coordinator.scanInput = model.scanFeatureAvailable ? model.scanInput : nil
+        context.coordinator.scanCapture = model.scanFeatureAvailable ? model.scanCapture : nil
+        let drawingTap = DrawingTapRecognizer(target: context.coordinator, action: #selector(Coordinator.handleDrawingTap(_:)))
+        drawingTap.cancelsTouchesInView = false
+        drawingTap.delegate = context.coordinator
+        arView.addGestureRecognizer(drawingTap)
 
         context.coordinator.rootAnchor = AnchorEntity(world: .zero)
         if let root = context.coordinator.rootAnchor {
@@ -101,12 +136,27 @@ struct ARRendererView: UIViewRepresentable {
     func updateUIView(_ arView: ARView, context: Context) {
         context.coordinator.uiBridge.model = model
         context.coordinator.arView = arView
+        context.coordinator.scanInput = model.scanFeatureAvailable ? model.scanInput : nil
+        context.coordinator.scanCapture = model.scanFeatureAvailable ? model.scanCapture : nil
+        if model.scanFeatureAvailable {
+            model.scanInput.alignmentChanged(model.positionAlignmentRevision)
+            if !model.arCameraActive || model.treeSurvey.active || model.drawing.active || model.drawingSelectionMode {
+                model.scanCapture.stop(reason:"AR画面または測定モードの変更")
+            }
+        }
+        context.coordinator.synchronizeDroggerContext(model:model)
         context.coordinator.setSessionActive(model.arCameraActive, on: arView)
-        context.coordinator.setLiDARPreference(model.lidarEnabled, on: arView)
+        context.coordinator.setScanCaptureEnabled(model.scanFeatureAvailable && model.scanCapture.isRecording, on:arView)
+        if model.scanFeatureAvailable {
+            context.coordinator.scanPreviewRenderer.update(model.scanCapture,view:arView,frame:model.arCameraActive ? arView.session.currentFrame:nil)
+        }
+        context.coordinator.setLiDARPreference(model.lidarEnabled, measurementEnabled: model.drawing.active || model.treeSurvey.active, on: arView)
         context.coordinator.setLiDARFadePreference(
             enabled: model.settings.lidarFadeBehindObjectsEnabled,
             behindOpacity: Float(model.settings.lidarBehindOpacity)
         )
+        context.coordinator.consumeTreeCaptureRequest()
+        context.coordinator.consumeDrawingCaptureRequest()
         guard model.arCameraActive else { return }
         guard let root = context.coordinator.rootAnchor else { return }
 
@@ -127,17 +177,13 @@ struct ARRendererView: UIViewRepresentable {
             ),
             interfaceOrientation: arView.window?.windowScene?.interfaceOrientation ?? .portrait
         )
-        model.updateRenderedTransform(
-            panEastMeters: model.planePanEastMeters,
-            panNorthMeters: model.planePanNorthMeters,
-            rootHeightMeters: Double(renderedRootHeight),
-            totalHeadingDegrees: renderedTotalHeading
-        )
+        context.coordinator.recordRenderedTransform(model:model,heading:renderedTotalHeading,height:Double(renderedRootHeight))
 
         // 撮影要求は、表示要素が多い場合の再描画判定より先に受け付ける。
         // タップ後の反応を遅らせず、Coordinator側の監視タイマーもすぐ開始する。
         // AppModel側ですでにタイムアウト／失敗になった古い要求を、画面復帰後に
         // 遅れて撮影しない。要求が有効な撮影待ち状態の間だけCoordinatorへ渡す。
+        context.coordinator.updatePhotoContext(model:model,location:locationManager)
         if model.photoCaptureState == .capturing {
             context.coordinator.capturePhotoIfRequested(model.photoCaptureRequestID, from: arView)
         }
@@ -152,18 +198,519 @@ struct ARRendererView: UIViewRepresentable {
             showDistance: model.distancesEnabled,
             into: root
         )
+        context.coordinator.updateDrawing(model: model)
+        context.coordinator.updateTreeDisplay(model:model)
     }
 
-    final class Coordinator: NSObject, ARSessionDelegate {
+    final class Coordinator: NSObject, ARSessionDelegate, UIGestureRecognizerDelegate {
+        func gestureRecognizer(_ gestureRecognizer:UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other:UIGestureRecognizer) -> Bool {
+            gestureRecognizer is DrawingTapRecognizer || other is DrawingTapRecognizer
+        }
+
         fileprivate let uiBridge = ARRendererUIBridge()
         weak var arView: ARView?
+        weak var scanInput: GCPInputSession?
+        weak var scanCapture: ScanCaptureController?
+        private var scanReconstructionEnabled=false
+        fileprivate let scanPreviewRenderer=ScanPreviewRenderer()
         var rootAnchor: AnchorEntity?
+
+        private var drawingEntity = Entity()
+        private var lastTreeCaptureRequest = 0
+        private var lastDrawingCaptureRequest = 0
+        private var treeEntity = Entity()
+        private var treeRayAnchor = AnchorEntity(world:.zero)
+        private var treeMeshes:[UUID:(entity:Entity,visual:TreeVisual,labels:[TreeExtraLabel])] = [:]
+        private lazy var treeBodyMesh=makeTreeUnitMesh(ring:false)
+        private lazy var treeRingMesh=makeTreeUnitMesh(ring:true)
+        private var treeDirectionsEntity=Entity()
+        private var treeDirectionsKey=""
+        private var treeDirectionLabels:[TreeExtraLabel]=[]
+        private let treeDirectionIDs=[UUID(),UUID()]
+        private var treeExtraLabels:[TreeExtraLabel]=[]
+        private struct TreeExtraLabel {var id:UUID;var position:SIMD3<Float>;var text:String}
+        private var treeProjectionKey = ""
+        private struct TreeVisual:Equatable {
+            var id:UUID;var position:SIMD3<Float>;var radius:Float;var color:TreeColor;var number:String
+            var bounds:TreePreviewBounds?;var lower:Float?;var upper:Float?;var ticks:[Int]=[]
+            var preview=false
+        }
+        private var treeVisuals: [TreeVisual] = []
+        private var treeLabels: [TreeVisual] = []
+        private var lastTreeDisplayTime: Double = 0
+        private var lastTreeRays: [ObservationRay] = []
+        private var treeMarkers: [UUID:(entity:ModelEntity,position:SIMD3<Float>,scale:Float)] = [:]
+        private var treeMarkerLabels: [(id:UUID,position:SIMD3<Float>,number:Int)] = []
+        private var observationAnchor = AnchorEntity(world: .zero)
+        private var observationRay: ObservationRay?
+        private var observationEpoch = 0
+        private var droggerWorldEpoch = 0
+        private var droggerOffset = SIMD3<Float>.zero
+        private var drawingResetID = 0
+        private var importedSnapPaths:[DrawingSnapPath] = []
+        private var drawnSnapPaths:[DrawingSnapPath] = []
+        private var snapImportRevision = -1
+        private var snapDrawingVersion:DrawingState?
+        private var snapPaths:[DrawingSnapPath] {importedSnapPaths+drawnSnapPaths}
+        private var drawingIsActive = false
+        private var drawingDistances: [DrawingDistance] = []
+        private var drawingDistanceMode: DrawingDistanceMode = .slope
+        private var previousDrawingFadeEnabled: Bool?
+        private var registeringDrawingOcclusion = false
+        private var drawingVersion: DrawingState?
+        private var drawingPathCache: [UUID:(points:[SIMD3<Float>], entity:Entity, radius:Float, selected:Bool, pointsOnly:Bool)] = [:]
+        private var previousDrawingWidth: Double?
+        private var previousDrawingPointScale: Float?
+        private var previousDrawingSelection: UUID?
+        private lazy var drawingPointMesh = MeshResource.generateSphere(radius:0.035)
+        private let drawingMaterial = UnlitMaterial(color:.systemOrange)
+
+        @MainActor
+        func updateTreeDisplay(model: AppModel, force: Bool = false) {
+            guard let root=rootAnchor,let view=arView,let frame=view.session.currentFrame else {return}
+            let now=ProcessInfo.processInfo.systemUptime
+            guard force || now-lastTreeDisplayTime>=0.2 else {return}
+            lastTreeDisplayTime=now
+            if treeEntity.parent == nil {root.addChild(treeEntity)}
+            let survey=model.treeSurvey
+            let origin=model.origin,datum=model.drawingCaptureDatum
+            let key="\(survey.recordsRevision):\(survey.frame?.id.uuidString ?? ""):\(origin?.latitude.description ?? "nil"):\(origin?.longitude.description ?? "nil"):\(datum?.description ?? "nil")"
+            func visual(_ record:TreeRecord,preview:Bool)->TreeVisual? {
+                guard let fixed=survey.frame,let position=try? TreeCoordinateBridge.display(record.geometry.circle.center,frame:fixed,origin:origin,datum:datum) else {return nil}
+                let bounds=TreePreviewBounds.make(record.geometry,preview:preview)
+                let lower=bounds.map {position.y+Float($0.lower-record.geometry.circle.center.up)}
+                let upper=bounds.map {position.y+Float($0.upper-record.geometry.circle.center.up)}
+                return TreeVisual(id:record.id,position:position,radius:Float(record.geometry.circle.radius),color:preview ? survey.color:record.color,number:preview ? survey.numberInput:String(record.number),bounds:bounds,lower:lower,upper:upper,preview:preview)
+            }
+            if key != treeProjectionKey {
+                treeProjectionKey=key
+                treeVisuals=survey.records.compactMap {visual($0,preview:false)}
+                survey.reportDisplayUnavailable(survey.records.count-treeVisuals.count)
+            }
+            var visuals=treeVisuals
+            let candidateID=survey.active ? survey.candidate?.id:nil
+            if let candidate=survey.candidate,survey.active,let item=visual(candidate,preview:true) {
+                visuals.removeAll {$0.id==candidate.id};visuals.append(item)
+            }
+            let camera=SIMD3(frame.camera.transform[3].x,frame.camera.transform[3].y,frame.camera.transform[3].z)
+            let matrix=root.transformMatrix(relativeTo:nil)
+            let localCamera=DiagramTransform.localPoint(camera,root:matrix)
+            let distances=visuals.map {($0.id,TreeDisplayBudget.distance(camera:localCamera,center:$0.position,lower:$0.lower,upper:$0.upper))}
+            let selected=TreeDisplayBudget.selected(distances,priority:candidateID)
+            let visualByID=Dictionary(uniqueKeysWithValues:visuals.map {($0.id,$0)})
+            var visible=selected.compactMap {visualByID[$0]}
+            let ticks=TreeDisplayBudget.tickAllocation(visible.map {($0.id,$0.bounds?.metreTicks ?? [])})
+            for i in visible.indices {visible[i].ticks=ticks[visible[i].id] ?? []}
+            let ids=Set(visible.map(\.id))
+            for id in Array(treeMeshes.keys) where !ids.contains(id) {
+                treeMeshes[id]?.entity.removeFromParent();treeMeshes[id]=nil
+            }
+            for item in visible {
+                if let old=treeMeshes[item.id],old.visual==item {continue}
+                treeMeshes[item.id]?.entity.removeFromParent()
+                let entity=Entity();treeEntity.addChild(entity)
+                var labels:[TreeExtraLabel]=[]
+                addTreeRing(position:item.position,radius:item.radius,provisional:false,color:item.color,into:entity)
+                if let lower=item.lower,let upper=item.upper,let bounds=item.bounds,upper>lower,let mesh=treeBodyMesh {
+                    var material=UnlitMaterial(color:item.color.uiColor)
+                    material.blending = .transparent(opacity:.init(floatLiteral:bounds.provisional ? 0.12:0.22))
+                    let body=ModelEntity(mesh:mesh,materials:[material]);body.position=SIMD3(item.position.x,(lower+upper)/2,item.position.z)
+                    body.scale=SIMD3(item.radius,upper-lower,item.radius);entity.addChild(body)
+                    addTreeRing(position:SIMD3(item.position.x,lower,item.position.z),radius:item.radius,provisional:bounds.lowerProvisional,color:item.color,into:entity)
+                    addTreeRing(position:SIMD3(item.position.x,upper,item.position.z),radius:item.radius,provisional:bounds.upperProvisional,color:item.color,into:entity)
+                    for metre in item.ticks {
+                        let position=SIMD3(item.position.x,lower+Float(metre),item.position.z)
+                        addTreeRing(position:position,radius:item.radius*1.04,provisional:bounds.upperProvisional,color:item.color,into:entity)
+                        if item.preview,bounds.labelledMetres.contains(metre) {labels.append(TreeExtraLabel(id:UUID(),position:position+SIMD3(item.radius+0.07,0,0),text:"\(metre)m"))}
+                    }
+                    if item.preview {labels.insert(TreeExtraLabel(id:UUID(),position:SIMD3(item.position.x,upper,item.position.z),text:bounds.title),at:0)}
+                }
+                treeMeshes[item.id]=(entity,item,labels)
+            }
+            treeLabels=Array(visible.prefix(12))
+            treeExtraLabels=visible.flatMap {treeMeshes[$0.id]?.labels ?? []}
+            let directionKey=key+":\(survey.displayRevision)"
+            if directionKey != treeDirectionsKey || treeDirectionsEntity.parent == nil {
+                treeDirectionsKey=directionKey;treeDirectionsEntity.children.removeAll();treeDirectionLabels=[]
+                if treeDirectionsEntity.parent == nil {treeEntity.addChild(treeDirectionsEntity)}
+                if let fixed=survey.frame {
+                    for (i,sight) in survey.directionSights.prefix(2).enumerated() {
+                        guard let unit=sight.ray.unit else {continue}
+                        let length=min(40,max(0.3,simd_length(sight.target.vector-sight.ray.origin.vector)))
+                        let end=sight.ray.origin.vector+unit*length
+                        guard let start=try? TreeCoordinateBridge.display(sight.ray.origin,frame:fixed,origin:origin,datum:datum),
+                              let finish=try? TreeCoordinateBridge.display(TreePoint(east:end.x,north:end.y,up:end.z),frame:fixed,origin:origin,datum:datum) else {continue}
+                        // Dashes and a flat cross identify a direction, never a measured sphere.
+                        let delta=finish-start
+                        for dash in 0..<16 {
+                            let a=Float(dash)/16,b=(Float(dash)+0.55)/16
+                            addTreeSightSegment(start+a*delta,start+b*delta,into:treeDirectionsEntity)
+                        }
+                        addTreeSightSegment(finish+SIMD3(-0.06,0,0),finish+SIMD3(0.06,0,0),into:treeDirectionsEntity)
+                        addTreeSightSegment(finish+SIMD3(0,-0.06,0),finish+SIMD3(0,0.06,0),into:treeDirectionsEntity)
+                        treeDirectionLabels.append(TreeExtraLabel(id:treeDirectionIDs[i],position:finish,text:sight.side.rawValue))
+                    }
+                }
+            }
+            let markers=survey.markers.compactMap {marker -> (id:UUID,position:SIMD3<Float>,number:Int)? in
+                guard let fixed=survey.frame,let position=try? TreeCoordinateBridge.display(marker.point,frame:fixed,origin:origin,datum:datum) else {return nil}
+                return (marker.id,position,marker.number)
+            }
+            let markerIDs=Set(markers.map(\.id))
+            for id in Array(treeMarkers.keys) where !markerIDs.contains(id) {
+                treeMarkers[id]?.entity.removeFromParent();treeMarkers[id]=nil
+            }
+            // Tree capture dots are one third of the ordinary point diameter; measurement geometry is unchanged.
+            let pointScale=DrawingGeometry.pointScale(lineWidth:model.drawingLineWidth,referenceWidth:model.drawingPointReferenceWidth)*TreeCaptureStyle.scale
+            for marker in markers {
+                if let old=treeMarkers[marker.id],old.position==marker.position,old.scale==pointScale,old.entity.parent === treeEntity {continue}
+                treeMarkers[marker.id]?.entity.removeFromParent()
+                let dot=ModelEntity(mesh:drawingPointMesh,materials:[drawingMaterial])
+                dot.position=marker.position;dot.scale=SIMD3(repeating:pointScale)
+                treeEntity.addChild(dot)
+                treeMarkers[marker.id]=(dot,marker.position,pointScale)
+            }
+            treeMarkerLabels=markers
+            let rays=survey.active ? survey.rays : []
+            if rays != lastTreeRays {
+                lastTreeRays=rays;treeRayAnchor.children.removeAll()
+                if !rays.isEmpty,treeRayAnchor.scene==nil {view.scene.addAnchor(treeRayAnchor)}
+                for ray in rays.prefix(TreeDisplayBudget.maximumRays) {
+                    addCylinder(from:ray.origin,to:ray.origin+ray.direction*10,radius:TreeCaptureStyle.observationRadius,material:UnlitMaterial(color:.systemPink),registerForOcclusion:false,into:treeRayAnchor)
+                }
+            }
+        }
+
+        private func makeTreeUnitMesh(ring:Bool)->MeshResource? {
+            let data=TreeUnitMesh.make(ring:ring)
+            var descriptor=MeshDescriptor()
+            descriptor.positions=MeshBuffers.Positions(data.positions);descriptor.primitives = .triangles(data.indices)
+            return try? MeshResource.generate(from:[descriptor])
+        }
+        private func addTreeRing(position:SIMD3<Float>,radius:Float,provisional:Bool,color:TreeColor,into parent:Entity) {
+            guard let mesh=treeRingMesh else {return}
+            var material=UnlitMaterial(color:provisional ? .systemCyan:color.uiColor)
+            if provisional {material.blending = .transparent(opacity:.init(floatLiteral:0.5))}
+            let ring=ModelEntity(mesh:mesh,materials:[material]);ring.position=position;ring.scale=SIMD3(repeating:radius);parent.addChild(ring)
+        }
+        private func addTreeSightSegment(_ start:SIMD3<Float>,_ end:SIMD3<Float>,into parent:Entity) {
+            guard let mesh=treeBodyMesh else {return}
+            let delta=end-start,length=simd_length(delta)
+            guard length>0.0001,length.isFinite else {return}
+            let entity=ModelEntity(mesh:mesh,materials:[UnlitMaterial(color:.systemCyan)])
+            entity.position=(start+end)/2;entity.scale=SIMD3(TreeCaptureStyle.directionRadius,length,TreeCaptureStyle.directionRadius)
+            entity.orientation=simd_quatf(from:SIMD3(0,1,0),to:delta/length);parent.addChild(entity)
+        }
+
+        @MainActor
+        func updateDrawing(model: AppModel) {
+            uiBridge.model = model
+            if model.drawingSnapEnabled,model.drawing.active,!model.treeSurvey.active {
+                let features=model.renderFeatures
+                if snapImportRevision != model.drawingSnapGeometryRevision {
+                    snapImportRevision=model.drawingSnapGeometryRevision
+                    importedSnapPaths=features.map {feature in
+                        let heights=feature.sourceAltitudes ?? []
+                        let vertexHeights=(feature.pillarPositions == nil ? feature.sourceAltitudes:feature.pillarSourceAltitudes) ?? []
+                        return DrawingSnapPath(points:feature.positions,vertices:feature.pillarPositions ?? feature.positions,heights:heights,vertexHeights:vertexHeights,segments:feature.kind != .point,closed:feature.kind == .polygon,source:.imported,heightSources:heights.map {_ in .sourceDrawing},vertexHeightSources:vertexHeights.map {_ in .sourceDrawing})
+                    }
+                }
+                if snapDrawingVersion != model.drawing {
+                    snapDrawingVersion=model.drawing
+                    drawnSnapPaths=(model.drawing.completed+[model.drawing.draft]).filter {!$0.points.isEmpty}.map {path in
+                        let heights=path.vertices?.map(\.elevation) ?? [],sources=path.vertices?.map(\.elevationSource) ?? []
+                        return DrawingSnapPath(points:path.points,vertices:path.points,heights:heights,vertexHeights:heights,segments:!path.isPointCollection,source:path.id == model.drawing.draft.id ? .input:.saved,heightSources:sources,vertexHeightSources:sources)
+                    }
+                }
+            }
+            drawingIsActive = model.drawing.active
+            if drawingDistanceMode != model.settings.drawingDistanceMode {
+                drawingDistanceMode = model.settings.drawingDistanceMode
+                updateProjectedLabels(force:true)
+            }
+            if model.drawingObservationResetID != drawingResetID || !drawingIsActive {
+                drawingResetID = model.drawingObservationResetID
+                clearObservation()
+            }
+            // render() may remove all root children; restore the independent drawing child.
+            if drawingEntity.parent == nil { rootAnchor?.addChild(drawingEntity) }
+            let selectedID=model.drawingSelectionMode ? model.selectedDrawingID : nil
+            let pointScale=DrawingGeometry.pointScale(lineWidth:model.drawingLineWidth,referenceWidth:model.drawingPointReferenceWidth)
+            let pointSizeChanged=previousDrawingPointScale != pointScale
+            let fadeEnabled = requestedLiDAREnabled && lidarFadePreferenceEnabled
+            let fadeChanged = previousDrawingFadeEnabled != fadeEnabled
+            guard drawingVersion != model.drawing || previousDrawingWidth != model.drawingLineWidth || pointSizeChanged || previousDrawingSelection != selectedID || fadeChanged else { return }
+            previousDrawingFadeEnabled = fadeEnabled
+            registeringDrawingOcclusion = true
+            defer {
+                registeringDrawingOcclusion = false
+                // Undo, delete and style changes detach geometry retained by the target list.
+                // Remove those references before the next depth frame, then reindex all budgets.
+                occlusionTargets.removeAll { target in
+                    guard target.isDrawing else { return false }
+                    var ancestor: Entity? = target.entity
+                    while let node = ancestor {
+                        if node === drawingEntity { return false }
+                        ancestor = node.parent
+                    }
+                    return true
+                }
+                rebuildOcclusionIndices()
+                let labelIDs = Set(currentLabels.map(\.id) + drawingDistances.map(\.id))
+                labelOpacityByID = labelOpacityByID.filter { labelIDs.contains($0.key) }
+                updateProjectedLabels(force:true)
+            }
+            previousDrawingPointScale=pointScale
+            drawingVersion = model.drawing
+            previousDrawingWidth=model.drawingLineWidth; previousDrawingSelection=selectedID
+            let paths = (model.drawing.completed + [model.drawing.draft]).filter { !$0.points.isEmpty }
+            let current = model.drawing.currentPaths
+            let other = model.drawing.completed.filter { $0.resolvedLayerID != model.drawing.currentLayerID }
+            drawingDistances = DrawingDistance.segments([model.drawing.draft]+Array(current.reversed())+Array(other.reversed()))
+            let validIDs = Set(paths.map(\.id))
+            for id in Array(drawingPathCache.keys) where !validIDs.contains(id) {
+                drawingPathCache.removeValue(forKey:id)?.entity.removeFromParent()
+            }
+            func addPoint(_ point: SIMD3<Float>, material:UnlitMaterial, to entity:Entity) {
+                let dot = ModelEntity(mesh:drawingPointMesh,materials:[material])
+                dot.scale = SIMD3(repeating:pointScale)
+                dot.position = point; entity.addChild(dot)
+                if fadeEnabled {
+                    registerOcclusionTarget(entity:dot,samplePositions:pointOcclusionSamples(center:point,radius:0.035*pointScale),kind:.point)
+                }
+            }
+            func addLine(_ a:SIMD3<Float>, _ b:SIMD3<Float>, radius:Float, material:UnlitMaterial, to entity:Entity) {
+                // A tiny segment still occupies one child so Undo can remove the last pair.
+                let line = Entity()
+                addCylinder(from:a,to:b,radius:radius,material:material,registerForOcclusion:fadeEnabled,into:line)
+                entity.addChild(line)
+            }
+            for path in paths {
+                let cached = drawingPathCache[path.id]
+                let entity = cached?.entity ?? Entity()
+                if entity.parent == nil { drawingEntity.addChild(entity) }
+                let selected=path.id==selectedID
+                let radius=Float(model.drawingLineWidth/2)*(selected ? 1.5 : 1)
+                let material=selected ? UnlitMaterial(color:.systemYellow) : drawingMaterial
+                let sameStyle = !fadeChanged && !pointSizeChanged && cached?.radius==radius && cached?.selected==selected && cached?.pointsOnly==path.isPointCollection
+                let delta=sameStyle ? DrawingPathDelta.classify(old:cached?.points ?? [],new:path.points) : .rebuild
+                switch delta {
+                case .unchanged: break
+                case .append:
+                    if !path.isPointCollection, let last = cached?.points.last { addLine(last,path.points.last!,radius:radius,material:material,to:entity) }
+                    addPoint(path.points.last!,material:material,to:entity)
+                case .removeLast:
+                    Array(entity.children).last?.removeFromParent()
+                    if !path.isPointCollection, !path.points.isEmpty { Array(entity.children).last?.removeFromParent() }
+                case .rebuild:
+                    entity.children.removeAll()
+                    for (index,point) in path.points.enumerated() {
+                        if !path.isPointCollection, index > 0 { addLine(path.points[index-1],point,radius:radius,material:material,to:entity) }
+                        addPoint(point,material:material,to:entity)
+                    }
+                }
+                drawingPathCache[path.id] = (path.points,entity,radius,selected,path.isPointCollection)
+            }
+        }
+
+        @MainActor
+        private func clearObservation() {
+            guard observationRay != nil || uiBridge.model?.drawingHasObservation == true else { return }
+            observationRay = nil; observationAnchor.children.removeAll()
+            // updateDrawing is also called inside SwiftUI.updateUIView. Publishing here
+            // synchronously (even false -> false) creates a view-update feedback loop.
+            Task { @MainActor [weak self] in
+                guard let self, self.observationRay == nil,
+                      let model = self.uiBridge.model, model.drawingHasObservation else { return }
+                model.drawingHasObservation = false
+                if model.drawingMessage.hasPrefix("視線") || model.drawingMessage.contains("横へ移動") { model.drawingMessage="視線取消・再観測" }
+            }
+        }
+
+        @MainActor
+        private func showObservation(_ ray: ObservationRay) {
+            observationRay = ray
+            if observationAnchor.scene == nil { arView?.scene.addAnchor(observationAnchor) }
+            observationAnchor.children.removeAll()
+            addCylinder(from:ray.origin,to:ray.origin+ray.direction*10,radius:0.008,material:UnlitMaterial(color:.systemPink),registerForOcclusion:false,into:observationAnchor)
+            uiBridge.model?.drawingHasObservation = true
+        }
+
+        /// A tap can arrive before SwiftUI applies the last alignment gesture.
+        /// Apply pending alignment once, then use this matrix for every capture
+        /// path so the next updateUIView cannot move a newly captured world point.
+        @MainActor
+        func synchronizeDrawingTransform(model:AppModel) -> simd_float4x4? {
+            guard let root=rootAnchor else { return nil }
+            synchronizeDroggerContext(model:model)
+            let height=Float(model.effectiveDisplayPlaneOffsetMeters)
+            let heading=updateDisplayState(
+                eastMeters:Float(model.planePanEastMeters),
+                northMeters:Float(model.planePanNorthMeters),
+                heightMeters:height,
+                manualHeadingDegrees:model.headingOffsetDegrees,
+                automaticHeadingDegrees:model.automaticHeadingCorrectionDegrees,
+                headingInput:headingInput,
+                interfaceOrientation:interfaceOrientation
+            )
+            let matrix=root.transformMatrix(relativeTo:nil)
+            guard DiagramTransform.validRigid(matrix) else { return nil }
+            recordRenderedTransform(model:model,heading:heading,height:Double(height))
+            return matrix
+        }
+
+        @MainActor
+        func synchronizeDroggerContext(model:AppModel) {
+            model.drogger.synchronizeContext(origin:model.origin,revision:model.positionAlignmentRevision,epoch:droggerWorldEpoch)
+            droggerOffset=model.drogger.worldOffset
+        }
+
+        @MainActor
+        func recordRenderedTransform(model:AppModel,heading:Double,height:Double) {
+            // Expose the complete root transform to centre-update and photo coordinates.
+            // The correction itself remains session-local; it never edits stored vertices.
+            let pan=DroggerFusion.renderedPan(east:model.planePanEastMeters,north:model.planePanNorthMeters,heading:heading,offset:droggerOffset)
+            model.updateRenderedTransform(panEastMeters:pan.x,panNorthMeters:pan.y,rootHeightMeters:height,totalHeadingDegrees:heading)
+        }
+
+        @MainActor
+        private func updateDrogger(using frame:ARFrame,normal:Bool) {
+            guard isSessionActive, let model=uiBridge.model, model.drogger.needsARUpdates, let root=rootAnchor else { return }
+            // Apply a pending gesture before storing a timed pose, just as tap capture does.
+            guard synchronizeDrawingTransform(model:model) != nil else { return }
+            var base=root.transformMatrix(relativeTo:nil)
+            base.columns.3 -= SIMD4(droggerOffset,0)
+            droggerOffset=model.drogger.recordFrame(time:frame.timestamp,camera:frame.camera.transform,baseRoot:base,origin:model.origin,revision:model.positionAlignmentRevision,epoch:droggerWorldEpoch,normal:normal)
+            applyRootTransform()
+            recordRenderedTransform(model:model,heading:manualHeadingDegrees+displayedAutomaticHeadingCorrectionDegrees,height:Double(displayHeightMeters))
+        }
+
+        @MainActor
+        func consumeTreeCaptureRequest() {
+            guard let survey=uiBridge.model?.treeSurvey,survey.capturePending,survey.captureRequestID != lastTreeCaptureRequest else {return}
+            let id=survey.captureRequestID;lastTreeCaptureRequest=id
+            DispatchQueue.main.async { [weak self] in
+                guard let self,let survey=self.uiBridge.model?.treeSurvey,survey.capturePending,survey.captureRequestID==id else {return}
+                defer {survey.finishCenterCapture(id)}
+                guard let view=self.arView else {survey.reportCaptureUnavailable("AR画面の準備待ち");return}
+                self.handleDrawingInput(at:CGPoint(x:view.bounds.midX,y:view.bounds.midY))
+            }
+        }
+        @MainActor
+        func consumeDrawingCaptureRequest() {
+            guard let model=uiBridge.model,model.drawingCapturePending,model.drawingCaptureRequestID != lastDrawingCaptureRequest else {return}
+            let id=model.drawingCaptureRequestID;lastDrawingCaptureRequest=id
+            DispatchQueue.main.async { [weak self] in
+                guard let self,let model=self.uiBridge.model,model.drawingCapturePending,model.drawingCaptureRequestID==id else {return}
+                defer {model.finishDrawingCapture(id)}
+                guard let view=self.arView else {model.drawingMessage="AR画面の準備待ち";return}
+                self.handleDrawingInput(at:CGPoint(x:view.bounds.midX,y:view.bounds.midY))
+            }
+        }
+        @MainActor
+        @objc func handleDrawingTap(_ recognizer: UIGestureRecognizer) {
+            // Touch selection remains available, but geometry sampling is centre-confirm only.
+            guard let model=uiBridge.model,model.drawingSelectionMode,!model.drawing.active,!model.treeSurvey.active,let view=arView else {return}
+            handleDrawingInput(at:recognizer.location(in:view))
+        }
+        @MainActor
+        private func handleDrawingInput(at tap:CGPoint) {
+            guard let model = uiBridge.model, model.drawing.active || model.drawingSelectionMode || model.treeSurvey.active else { return }
+            func rejected(_ message:String) {
+                model.drawingMessage=message
+                if model.treeSurvey.active {model.treeSurvey.reportCaptureUnavailable(message)}
+            }
+            guard model.canEditWork else { rejected("復元待ち"); return }
+            guard let view=arView, let frame=view.session.currentFrame,
+                  isSessionActive, hasReceivedActiveFrame else { rejected("AR準備待ち・再タップ"); return }
+            guard case .normal = frame.camera.trackingState,
+                  ProcessInfo.processInfo.systemUptime-frame.timestamp < 0.5 else {
+                rejected("AR追跡待ち・周囲も映してください"); return
+            }
+            if let orientation=view.window?.windowScene?.interfaceOrientation,orientation != .unknown {interfaceOrientation=orientation}
+            guard view.bounds.width > 0, view.bounds.height > 0 else { rejected("画面準備待ち"); return }
+            guard let rootMatrix=synchronizeDrawingTransform(model:model) else { rejected("表示の更新待ち・再タップ");return }
+            let cameraFromWorld=simd_inverse(frame.camera.transform)
+            func projection()->(CGPoint,SIMD2<Float>,ObservationRay)? {
+                guard let image=DrawingProjection.imagePoint(viewPoint:tap,viewport:view.bounds.size,imageToView:frame.displayTransform(for:interfaceOrientation,viewportSize:view.bounds.size)),
+                      let pixel=DrawingProjection.pixel(imagePoint:image,resolution:frame.camera.imageResolution),
+                      let ray=DrawingProjection.ray(pixel:pixel,intrinsics:frame.camera.intrinsics,camera:frame.camera.transform,epoch:observationEpoch) else {return nil}
+                return (image,pixel,ray)
+            }
+            if model.treeSurvey.active {
+                guard let (image,pixel,ray)=projection() else {rejected("照準の画像座標を確認");return}
+                var world:SIMD3<Float>?,failure:DrawingDepthFailure?
+                if model.treeSurvey.needsSurfaceDistance && model.lidarEnabled && model.lidarSupported && measurementDepthEnabled {
+                    switch reliableDepthPoint(frame:frame,imagePoint:image,pixel:pixel) {
+                    case .success(let point):world=point
+                    case .failure(let reason):failure=reason
+                    }
+                }
+                let reference=TreeCaptureReference(root:rootMatrix,origin:model.origin,datum:model.drawingCaptureDatum,alignmentRevision:model.positionAlignmentRevision,epoch:observationEpoch)
+                model.treeSurvey.accept(ray:ray,depth:world,current:reference)
+                if let failure,model.treeSurvey.needsSurfaceDistance,!model.treeSurvey.rays.isEmpty {model.treeSurvey.reportCaptureUnavailable(failure.message+"・同じ樹皮を横移動して再確定")}
+                updateTreeDisplay(model:model,force:true);updateProjectedLabels(force:true)
+                return
+            }
+            if model.drawingSelectionMode {
+                let id=DrawingSelection.hit(paths:model.drawing.currentPaths,tap:SIMD2(Float(tap.x),Float(tap.y))) { point in
+                    let world=DrawingGeometry.point(point,transformedBy:rootMatrix)
+                    guard DrawingGeometry.point(world,transformedBy:cameraFromWorld).z < -0.05,
+                          let screen=view.project(world) else { return nil }
+                    return SIMD2(Float(screen.x),Float(screen.y))
+                }
+                model.selectDrawing(id)
+                return
+            }
+            if snapAllowed(model), let picked=pickDrawingPoint(tap,rootMatrix:rootMatrix,cameraFromWorld:cameraFromWorld,projectWorld:{ view.project($0) }) {
+                model.addDrawingPoint(picked.point,sourceAltitude:picked.altitude,altitudeSource:picked.elevationSource ?? .arEstimate); model.drawingMessage="吸着・"+picked.title+"を追加"
+                return
+            }
+            guard let (imagePoint,pixel,ray)=projection() else {rejected("照準の画像座標を確認");return}
+            let enabled=model.lidarEnabled && model.lidarSupported && measurementDepthEnabled
+            var depthFailure:DrawingDepthFailure?
+            let outcome=DrawingCapture.resolve(first:observationRay,next:ray,useDepth:enabled) {
+                switch self.reliableDepthPoint(frame:frame,imagePoint:imagePoint,pixel:pixel) {
+                case .success(let point):return point
+                case .failure(let reason):depthFailure=reason;return nil
+                }
+            }
+            let depthReason=depthFailure?.message ?? (!model.lidarEnabled ? "LiDARオフ":(!model.lidarSupported ? "LiDAR非対応":"深度準備待ち"))
+            switch outcome {
+            case .rejected(let reason):
+                if reason == .epoch { clearObservation() }
+                rejected(reason.message+"・"+depthReason)
+            case .point(let world,let depth):
+                model.addDrawingPoint(DiagramTransform.localPoint(world,root:rootMatrix))
+                clearObservation(); model.drawingMessage=depth ? String(format:"点追加・LiDAR %.2fm",Double(simd_length(world-ray.origin))) : "点追加・2視点"
+            case .hold:
+                showObservation(ray); model.drawingMessage="視線1/2・横移動（"+depthReason+"）"
+            }
+        }
+
+        @MainActor
+        private func snapAllowed(_ model:AppModel)->Bool {
+            DrawingSnap.allowed(enabled:model.drawingSnapEnabled,active:model.drawing.active,selecting:model.drawingSelectionMode,treeActive:model.treeSurvey.active,hasObservation:observationRay != nil || model.drawingHasObservation)
+        }
+        func pickDrawingPoint(_ tap:CGPoint,rootMatrix:simd_float4x4,cameraFromWorld:simd_float4x4,projectWorld:(SIMD3<Float>)->CGPoint?)->DrawingSnapHit? {
+            DrawingSnap.pick(tap,paths:snapPaths,root:rootMatrix,cameraFromWorld:cameraFromWorld,project:projectWorld)
+        }
+
+        private func reliableDepthPoint(frame:ARFrame,imagePoint:CGPoint,pixel:SIMD2<Float>)->Result<SIMD3<Float>,DrawingDepthFailure> {
+            guard let depth=frame.sceneDepth else {return .failure(.noDepth)}
+            return DrawingDepth.sample(map:depth.depthMap,confidence:depth.confidenceMap,imagePoint:imagePoint,pixel:pixel,intrinsics:frame.camera.intrinsics).flatMap {sample in
+                let world=DrawingGeometry.point(sample.cameraPoint,transformedBy:frame.camera.transform)
+                guard world.x.isFinite,world.y.isFinite,world.z.isFinite else {return .failure(.calibration)}
+                return .success(world)
+            }
+        }
 
         private var fallbackToGravityUsed = false
         private var currentAlignment: ARConfiguration.WorldAlignment = .gravityAndHeading
         private var lastRenderSignature: Int = 0
         private var textureCache: [UUID: TextureResource] = [:]
         private var requestedLiDAREnabled = false
+        private var measurementDepthEnabled = false
         private var lastAppliedLiDAREnabled: Bool?
         private var isSessionActive = false
         private var hasReceivedActiveFrame = false
@@ -205,6 +752,7 @@ struct ARRendererView: UIViewRepresentable {
             /// Entityの不透明度を連続的に決める。
             var samplePositions: [SIMD3<Float>]
             var kind: OcclusionTargetKind
+            var isDrawing: Bool
             var currentOpacity: Float = 1
         }
 
@@ -218,7 +766,7 @@ struct ARRendererView: UIViewRepresentable {
         private var labelOcclusionCursor = 0
         private var lidarFadePreferenceEnabled = true
         private var lidarFadeEffectiveActive = false
-        private var lidarBehindOpacity: Float = 0.28
+        private var lidarBehindOpacity: Float = 0.50
         private var lastDepthUpdateTime: CFTimeInterval = 0
         private var depthWasAvailable = false
 
@@ -227,6 +775,20 @@ struct ARRendererView: UIViewRepresentable {
         private var activePhotoCaptureRequestID: Int?
         private var photoSnapshotStarted = false
         private var photoCaptureWatchdog: DispatchWorkItem?
+        private var photoContext:PhotoCoordinateContext?
+        private var photoMode:PhotoCaptureMode = .arOverlay
+        private var photoSource:PhotoPositionSource = .ar
+        private var photoDeviceLocation:DeviceLocationObservation?
+        private var photoDeviceHeading:DeviceHeadingObservation?
+        private var photoSessionID=UUID()
+        private var photoAlignmentRevisionAtReset=0
+        @MainActor func updatePhotoContext(model:AppModel,location:LocationManager) {
+            photoContext=model.photoCoordinateContext
+            photoMode=model.activePhotoMode
+            photoSource=model.activePhotoPositionSource
+            photoDeviceLocation=location.photoLocation
+            photoDeviceHeading=location.photoHeading
+        }
 
         private struct LineSegment {
             var start: SIMD3<Float>
@@ -304,7 +866,7 @@ struct ARRendererView: UIViewRepresentable {
                 -rotatedPlayerEast,
                 displayHeightMeters,
                 rotatedPlayerNorth
-            )
+            ) + droggerOffset
             root.orientation = simd_quatf(angle: angle, axis: SIMD3<Float>(0, 1, 0))
         }
 
@@ -326,6 +888,9 @@ struct ARRendererView: UIViewRepresentable {
                 startSession(on: arView)
             } else {
                 guard isSessionActive else { return }
+                MainActor.assumeIsolated {scanCapture?.stop(reason:"ARセッション中断");scanCapture?.invalidatePreview()}
+                Task { @MainActor in self.clearObservation(); self.uiBridge.model?.reportDrawingSnap(nil); self.uiBridge.model?.drogger.suspendAR(); self.uiBridge.model?.treeSurvey.invalidateObservations("ARが停止しました") }
+                observationEpoch += 1
                 arView.session.pause()
                 isSessionActive = false
                 hasReceivedActiveFrame = false
@@ -372,7 +937,7 @@ struct ARRendererView: UIViewRepresentable {
             }
         }
 
-        func setLiDARPreference(_ enabled: Bool, on arView: ARView) {
+        func setLiDARPreference(_ enabled: Bool, measurementEnabled: Bool, on arView: ARView) {
             let supported = ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth)
             let effectiveEnabled = enabled && supported
             Task { @MainActor [uiBridge] in
@@ -380,6 +945,8 @@ struct ARRendererView: UIViewRepresentable {
             }
 
             requestedLiDAREnabled = effectiveEnabled
+            measurementDepthEnabled = measurementEnabled && effectiveEnabled
+            let depthEnabled = effectiveEnabled || measurementDepthEnabled
             if !effectiveEnabled {
                 if lidarFadeEffectiveActive {
                     resetOcclusionOpacity()
@@ -388,15 +955,33 @@ struct ARRendererView: UIViewRepresentable {
             }
 
             guard isSessionActive else { return }
-            guard lastAppliedLiDAREnabled != effectiveEnabled else { return }
-            lastAppliedLiDAREnabled = effectiveEnabled
+            guard lastAppliedLiDAREnabled != depthEnabled else { return }
+            lastAppliedLiDAREnabled = depthEnabled
+            Task { @MainActor [uiBridge] in uiBridge.model?.reportLiDARDepth(false) }
             if enabled && !supported {
                 setARStatus("LiDAR非対応端末です")
             }
             runARSession(on: arView, alignment: currentAlignment, resetTracking: false)
         }
 
+        func setScanCaptureEnabled(_ enabled:Bool,on arView:ARView) {
+            let active=ScanFeatureAvailability.isEnabled && enabled && ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) && ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth)
+            guard active != scanReconstructionEnabled else {return}
+            scanReconstructionEnabled=active
+            if isSessionActive {runARSession(on:arView,alignment:currentAlignment,resetTracking:false)}
+        }
+
         private func runARSession(on arView: ARView, alignment: ARConfiguration.WorldAlignment, resetTracking: Bool) {
+            if resetTracking { photoSessionID=UUID();photoAlignmentRevisionAtReset=photoContext?.alignmentRevision ?? 0 }
+            if resetTracking {MainActor.assumeIsolated {scanInput?.sessionReset(photoSessionID)}}
+            if resetTracking { observationEpoch += 1; droggerWorldEpoch += 1; droggerOffset = .zero }
+            Task { @MainActor in
+                if resetTracking { self.clearObservation() }
+                if resetTracking, let model = self.uiBridge.model,
+                   !model.drawing.completed.isEmpty || !model.drawing.draft.points.isEmpty {
+                    model.workNeedsRealignment = true
+                }
+            }
             currentAlignment = alignment
             arView.environment.background = .cameraFeed(exposureCompensation: 0.45)
             arView.isOpaque = false
@@ -407,7 +992,7 @@ struct ARRendererView: UIViewRepresentable {
             config.planeDetection = []
             config.isLightEstimationEnabled = true
 
-            if requestedLiDAREnabled {
+            if requestedLiDAREnabled || measurementDepthEnabled {
                 if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
                     config.frameSemantics.insert(.sceneDepth)
                 }
@@ -415,11 +1000,15 @@ struct ARRendererView: UIViewRepresentable {
                 // 有効化せずLiDAR処理の余分な負荷を避ける。
             }
 
+            if scanReconstructionEnabled {
+                config.sceneReconstruction = .mesh
+                config.frameSemantics.insert(.sceneDepth)
+            }
             let options: ARSession.RunOptions = resetTracking ? [.resetTracking, .removeExistingAnchors] : []
             arView.session.run(config, options: options)
             isSessionActive = true
             hasReceivedActiveFrame = false
-            resetHeadingStabilization(clearCorrection: true)
+            if resetTracking { resetHeadingStabilization(clearCorrection: true) }
 
             let lidarText = requestedLiDAREnabled ? " / LiDAR補助" : ""
             switch alignment {
@@ -438,15 +1027,19 @@ struct ARRendererView: UIViewRepresentable {
             currentLabels = labels
             currentShowDistance = showDistance
             let useDepthFadeGeometry = requestedLiDAREnabled && lidarFadePreferenceEnabled
-            let validLabelIDs = Set(labels.map(\.id))
+            let validLabelIDs = Set(labels.map(\.id) + drawingDistances.map(\.id))
             labelOpacityByID = labelOpacityByID.filter { validLabelIDs.contains($0.key) }
             updateProjectedLabels(force: true)
 
+            let activeRasterIDs = Set(rasters.map(\.id))
+            textureCache = textureCache.filter { activeRasterIDs.contains($0.key) }
             let signature = renderSignature(features: features, rasters: rasters, labels: labels, selectedPosition: selectedPosition, style: style, showPillars: showPillars)
             guard signature != lastRenderSignature else { return }
             lastRenderSignature = signature
 
             root.children.removeAll()
+            // Re-register cached drawing geometry when imported geometry rebuilds the target list.
+            previousDrawingFadeEnabled = nil
             occlusionTargets.removeAll(keepingCapacity: true)
             linearOcclusionTargetIndices.removeAll(keepingCapacity: true)
             pointOcclusionTargetIndices.removeAll(keepingCapacity: true)
@@ -468,15 +1061,18 @@ struct ARRendererView: UIViewRepresentable {
             // 大量線分を1本ずつEntity化すると、RealityKit側のEntity数が増えて重くなる。
             // 線・柱は一度配列に集め、少数の結合メッシュとして追加する。
             var lineSegments: [LineSegment] = []
+            var coloredSegments: [SourceColor?: [LineSegment]] = [:]
             var pillarSegments: [LineSegment] = []
 
             for feature in features {
+                lineSegments.removeAll(keepingCapacity: true)
                 switch feature.kind {
                 case .point:
                     for position in feature.positions {
                         addPoint(
                             position,
                             radius: effectivePointRadius(at: position, style: style),
+                            sourceColor: feature.sourceColor,
                             showPillar: false,
                             registerForOcclusion: useDepthFadeGeometry,
                             to: root
@@ -490,15 +1086,19 @@ struct ARRendererView: UIViewRepresentable {
                 case .polygon:
                     appendBoundaryLine(feature.positions, pillarPositions: feature.pillarPositions, closed: true, style: style, showPillars: showPillars, lineSegments: &lineSegments, pillarSegments: &pillarSegments)
                 }
+                let color = feature.sourceColor
+                if !lineSegments.isEmpty { coloredSegments[color, default: []].append(contentsOf: lineSegments) }
             }
 
-            addSegmentMesh(
-                lineSegments,
-                material: lineMaterial,
-                registerForOcclusion: useDepthFadeGeometry,
-                preferredOcclusionPieceLength: 0.30,
-                into: root
-            )
+            for (color, segments) in coloredSegments {
+                var material = lineMaterial
+                if let color {
+                    material.color = .init(tint: color.uiColor.withAlphaComponent(1))
+                    if color.alpha < 1 { material.blending = .transparent(opacity: .init(floatLiteral: Float(color.alpha))) }
+                }
+                addSegmentMesh(segments, material: material, registerForOcclusion: useDepthFadeGeometry,
+                               preferredOcclusionPieceLength: 0.30, into: root)
+            }
             addSegmentMesh(
                 pillarSegments,
                 material: pillarMaterial,
@@ -543,6 +1143,8 @@ struct ARRendererView: UIViewRepresentable {
 
             for raster in rasters {
                 hasher.combine(raster.id)
+                hasher.combine(raster.image.size.width)
+                hasher.combine(raster.image.size.height)
                 hasher.combine(raster.positions.count)
                 if let first = raster.positions.first { hashPosition(first, scale: 10, into: &hasher) }
                 if let last = raster.positions.last { hashPosition(last, scale: 10, into: &hasher) }
@@ -557,6 +1159,7 @@ struct ARRendererView: UIViewRepresentable {
             for feature in features {
                 hasher.combine(feature.id)
                 hasher.combine(feature.kind.rawValue)
+                hasher.combine(feature.sourceColor)
                 hasher.combine(feature.positions.count)
                 for position in feature.positions {
                     hashPosition(position, scale: 100, into: &hasher)
@@ -591,12 +1194,9 @@ struct ARRendererView: UIViewRepresentable {
             let depth = simd_length(bottomLeft - topLeft)
             guard width > 0.05, depth > 0.05 else { return }
 
-            let center = (raster.positions[0] + raster.positions[1] + raster.positions[2] + raster.positions[3]) / 4
-            let edge = simd_normalize(topRight - topLeft)
-            let yaw = atan2(-edge.z, edge.x)
 
             let texture: TextureResource
-            if let cached = textureCache[raster.id] {
+            if let cached = textureCache[raster.id], cached.width == cgImage.width, cached.height == cgImage.height {
                 texture = cached
             } else if let generated = try? TextureResource(image: cgImage, options: .init(semantic: .color)) {
                 textureCache[raster.id] = generated
@@ -618,9 +1218,12 @@ struct ARRendererView: UIViewRepresentable {
             let realityOpacity = PhysicallyBasedMaterial.Opacity(floatLiteral: clampedOpacity)
             material.blending = .transparent(opacity: realityOpacity)
 
-            let plane = ModelEntity(mesh: .generatePlane(width: width, depth: depth), materials: [material])
-            plane.position = center + SIMD3<Float>(0, -0.02, 0)
-            plane.orientation = simd_quatf(angle: yaw, axis: SIMD3<Float>(0, 1, 0))
+            var descriptor = MeshDescriptor()
+            descriptor.positions = MeshBuffers.Positions(raster.positions.map { $0 + SIMD3<Float>(0,-0.02,0) })
+            descriptor.textureCoordinates = MeshBuffers.TextureCoordinates([SIMD2<Float>(0,0), SIMD2<Float>(1,0), SIMD2<Float>(1,1), SIMD2<Float>(0,1)])
+            descriptor.primitives = .triangles([0,2,1,0,3,2])
+            guard let mesh = try? MeshResource.generate(from: [descriptor]) else { return }
+            let plane = ModelEntity(mesh: mesh, materials: [material])
             root.addChild(plane)
             if registerForOcclusion {
                 registerOcclusionTarget(
@@ -634,13 +1237,19 @@ struct ARRendererView: UIViewRepresentable {
         private func addPoint(
             _ position: SIMD3<Float>,
             radius: Float,
+            sourceColor: SourceColor? = nil,
             showPillar: Bool,
             registerForOcclusion: Bool,
             to root: Entity
         ) {
             // 点は薄い板状だと真横から見えにくくなるため、球体表示に戻す。
             // 点数は表示制限で絞られるため、負荷の主因になりやすい線分より影響は小さい。
-            let sphere = ModelEntity(mesh: .generateSphere(radius: radius), materials: [pointMaterial])
+            var material = pointMaterial
+            if let color = sourceColor {
+                material.color = .init(tint: color.uiColor.withAlphaComponent(1))
+                if color.alpha < 1 { material.blending = .transparent(opacity: .init(floatLiteral: Float(color.alpha))) }
+            }
+            let sphere = ModelEntity(mesh: .generateSphere(radius: radius), materials: [material])
             sphere.position = position
             root.addChild(sphere)
             if registerForOcclusion {
@@ -1037,33 +1646,29 @@ struct ARRendererView: UIViewRepresentable {
 
         private func segmentOcclusionSamples(_ segments: [LineSegment]) -> [SIMD3<Float>] {
             guard !segments.isEmpty else { return [] }
-            let midpoints = segments.map { ($0.start + $0.end) / 2 }
-            let centroid = midpoints.reduce(SIMD3<Float>.zero) { $0 + $1 } / Float(midpoints.count)
+            // Sample the actual line, not the centroid between separate lines or shared
+            // endpoints. Those may lie behind a surface while the visible piece is in front.
+            // Length-spaced interior samples retain the existing maximum of nine probes.
+            let lengths = segments.map { simd_length($0.end - $0.start) }
+            let totalLength = lengths.reduce(0, +)
+            guard totalLength.isFinite, totalLength > 0.001 else { return [] }
+            let sampleCount = min(9, segments.count + 2)
             var samples: [SIMD3<Float>] = []
-            samples.reserveCapacity(9)
-
-            func appendUnique(_ candidate: SIMD3<Float>) {
-                guard !samples.contains(where: { simd_length($0 - candidate) < 0.01 }) else { return }
-                samples.append(candidate)
-            }
-
-            appendUnique(centroid)
-            appendUnique(segments[0].start)
-            appendUnique(segments[segments.count - 1].end)
-
-            if let value = midpoints.min(by: { $0.x < $1.x }) { appendUnique(value) }
-            if let value = midpoints.max(by: { $0.x < $1.x }) { appendUnique(value) }
-            if let value = midpoints.min(by: { $0.y < $1.y }) { appendUnique(value) }
-            if let value = midpoints.max(by: { $0.y < $1.y }) { appendUnique(value) }
-            if let value = midpoints.min(by: { $0.z < $1.z }) { appendUnique(value) }
-            if let value = midpoints.max(by: { $0.z < $1.z }) { appendUnique(value) }
-
-            if samples.count < 9 {
-                let remaining = 9 - samples.count
-                for index in 0..<remaining {
-                    let fraction = Float(index + 1) / Float(remaining + 1)
-                    let midpointIndex = min(midpoints.count - 1, Int(fraction * Float(midpoints.count)))
-                    appendUnique(midpoints[midpointIndex])
+            samples.reserveCapacity(sampleCount)
+            var segmentIndex = 0
+            var segmentStartDistance: Float = 0
+            for index in 0..<sampleCount {
+                let distance = totalLength * (Float(index) + 0.5) / Float(sampleCount)
+                while segmentIndex < segments.count - 1,
+                      distance > segmentStartDistance + lengths[segmentIndex] {
+                    segmentStartDistance += lengths[segmentIndex]
+                    segmentIndex += 1
+                }
+                let segment = segments[segmentIndex]
+                let fraction = max(0, min(1, (distance - segmentStartDistance) / max(lengths[segmentIndex], 0.001)))
+                let candidate = segment.start + (segment.end - segment.start) * fraction
+                if !samples.contains(where: { simd_length($0 - candidate) < 0.01 }) {
+                    samples.append(candidate)
                 }
             }
             return samples
@@ -1081,6 +1686,7 @@ struct ARRendererView: UIViewRepresentable {
                     entity: entity,
                     samplePositions: samplePositions,
                     kind: kind,
+                    isDrawing: registeringDrawingOcclusion,
                     currentOpacity: 1
                 )
             )
@@ -1092,6 +1698,12 @@ struct ARRendererView: UIViewRepresentable {
             case .raster:
                 rasterOcclusionTargetIndices.append(index)
             }
+        }
+
+        private func rebuildOcclusionIndices() {
+            linearOcclusionTargetIndices = occlusionTargets.indices.filter { occlusionTargets[$0].kind == .linearGeometry }
+            pointOcclusionTargetIndices = occlusionTargets.indices.filter { occlusionTargets[$0].kind == .point }
+            rasterOcclusionTargetIndices = occlusionTargets.indices.filter { occlusionTargets[$0].kind == .raster }
         }
 
         private func resetOcclusionOpacity() {
@@ -1112,7 +1724,9 @@ struct ARRendererView: UIViewRepresentable {
             guard now - lastDepthUpdateTime >= 0.20 else { return }
             lastDepthUpdateTime = now
 
-            guard let depthData = frame.sceneDepth,
+            guard case .normal = frame.camera.trackingState,
+                  let depthData = frame.sceneDepth,
+                  depthData.confidenceMap != nil,
                   let arView,
                   let root = rootAnchor,
                   arView.bounds.width > 1,
@@ -1138,7 +1752,9 @@ struct ARRendererView: UIViewRepresentable {
                 }
             }
 
-            guard let depthBase = CVPixelBufferGetBaseAddress(depthMap)?.assumingMemoryBound(to: Float32.self) else { return }
+            guard let depthBase = CVPixelBufferGetBaseAddress(depthMap)?.assumingMemoryBound(to: Float32.self) else {
+                resetOcclusionOpacity(); return
+            }
             let depthWidth = CVPixelBufferGetWidth(depthMap)
             let depthHeight = CVPixelBufferGetHeight(depthMap)
             let depthStride = CVPixelBufferGetBytesPerRow(depthMap) / MemoryLayout<Float32>.size
@@ -1149,6 +1765,8 @@ struct ARRendererView: UIViewRepresentable {
             let confidenceWidth = confidenceMap.map { CVPixelBufferGetWidth($0) } ?? 0
             let confidenceHeight = confidenceMap.map { CVPixelBufferGetHeight($0) } ?? 0
             let confidenceStride = confidenceMap.map { CVPixelBufferGetBytesPerRow($0) } ?? 0
+            guard depthWidth > 0, depthHeight > 0, confidenceBase != nil,
+                  confidenceWidth > 0, confidenceHeight > 0 else { resetOcclusionOpacity(); return }
 
             let viewportSize = arView.bounds.size
             let viewToImage = frame.displayTransform(for: interfaceOrientation, viewportSize: viewportSize).inverted()
@@ -1165,32 +1783,25 @@ struct ARRendererView: UIViewRepresentable {
                 let centerX = min(depthWidth - 1, max(0, Int(imageNormalized.x * CGFloat(depthWidth - 1))))
                 let centerY = min(depthHeight - 1, max(0, Int(imageNormalized.y * CGFloat(depthHeight - 1))))
                 let offsets = [(0, 0), (-2, 0), (2, 0), (0, -2), (0, 2)]
-                var samples: [Float] = []
+                var samples: [(depth:Float,confidence:UInt8?)] = []
                 samples.reserveCapacity(offsets.count)
 
                 for (dx, dy) in offsets {
                     let x = min(depthWidth - 1, max(0, centerX + dx))
                     let y = min(depthHeight - 1, max(0, centerY + dy))
 
+                    var confidence: UInt8?
                     if let confidenceBase, confidenceWidth > 0, confidenceHeight > 0 {
                         let cx = min(confidenceWidth - 1, max(0, x * confidenceWidth / max(depthWidth, 1)))
                         let cy = min(confidenceHeight - 1, max(0, y * confidenceHeight / max(depthHeight, 1)))
-                        let confidence = confidenceBase[cy * confidenceStride + cx]
-                        // low confidenceは除外し、medium/highだけを使う。
-                        guard confidence >= UInt8(clamping: ARConfidenceLevel.medium.rawValue) else { continue }
+                        confidence = confidenceBase[cy * confidenceStride + cx]
                     }
 
                     let value = depthBase[y * depthStride + x]
-                    if value.isFinite, value > 0.10, value < 20 {
-                        samples.append(value)
-                    }
+                    samples.append((value,confidence))
                 }
 
-                guard !samples.isEmpty else { return nil }
-                samples.sort()
-                // 中央値だけだと、手の輪郭で「近い画素2・背景3」の場合に背景側を選び、
-                // 細い遮蔽物を見落としやすい。近い側から2番目を使い、単発ノイズだけ除外する。
-                return samples[samples.count >= 3 ? 1 : 0]
+                return LiDARFade.sampledDepth(samples)
             }
 
             let cameraFromWorld = simd_inverse(frame.camera.transform)
@@ -1207,14 +1818,7 @@ struct ARRendererView: UIViewRepresentable {
                     worldPosition.z,
                     1
                 )
-                let virtualDepth = -cameraPosition.z
-                guard virtualDepth.isFinite, virtualDepth > 0.05 else { return nil }
-
-                // 1つの閾値で急に切り替えず、深度ノイズを吸収する18cm幅の遷移帯を設ける。
-                let delta = virtualDepth - realDepth
-                let transitionStart: Float = 0.12
-                let transitionEnd: Float = 0.30
-                return max(0, min(1, (delta - transitionStart) / (transitionEnd - transitionStart)))
+                return LiDARFade.behindWeight(cameraPosition:SIMD3(cameraPosition.x,cameraPosition.y,cameraPosition.z),realDepth:realDepth,trackingNormal:true)
             }
 
             let linearBatch = Self.circularBatch(
@@ -1258,8 +1862,11 @@ struct ARRendererView: UIViewRepresentable {
                         // 球体は分割描画しないため、どこか1点で確実に奥と分かれば全体を薄くする。
                         behindCoverage = strongestBehindWeight
                     case .linearGeometry:
-                        // 約30cm片では境界サンプル1点だけが手に隠れる場合も視認できる強さにする。
-                        behindCoverage = max(averageCoverage, strongestBehindWeight * 0.80)
+                        // Fade by the covered fraction; one hidden or valid depth sample
+                        // must not force the visible/unknown portion of a chunk to fade.
+                        behindCoverage = LiDARFade.linearCoverage(
+                            accumulatedWeight: accumulatedBehindWeight, sampleCount: samples.count
+                        )
                     case .raster:
                         behindCoverage = averageCoverage
                     }
@@ -1308,6 +1915,14 @@ struct ARRendererView: UIViewRepresentable {
                 }
                 updateProjectedLabels(force: true)
             }
+            // Distances belong to drawn lines and follow the same depth policy.
+            for distance in drawingDistances where projectedLabelIDs.contains(distance.id) {
+                let world = root.convert(position:distance.midpoint,to:nil)
+                let desired = behindWeight(at:world).map { Double(1-$0*(1-lidarBehindOpacity)) } ?? 1
+                let current = labelOpacityByID[distance.id] ?? 1
+                labelOpacityByID[distance.id] = current + (desired-current)*0.46
+            }
+            updateProjectedLabels(force:true)
         }
 
         private static func circularBatch(
@@ -1529,6 +2144,7 @@ struct ARRendererView: UIViewRepresentable {
             guard activePhotoCaptureRequestID == requestID,
                   photoCaptureInProgress,
                   !photoSnapshotStarted else { return }
+            guard let frame=arView.session.currentFrame,let root=rootAnchor,let context=photoContext else { return }
             photoSnapshotStarted = true
             notifyPhotoCaptureStarted(requestID)
             schedulePhotoCaptureWatchdog(
@@ -1538,6 +2154,49 @@ struct ARRendererView: UIViewRepresentable {
             )
             let labels = lastProjectedLabels
             let viewSize = arView.bounds.size
+            let rootMatrix=root.transformMatrix(relativeTo:nil)
+            let orientation=interfaceOrientation == .unknown ? .portrait : interfaceOrientation
+            let pose=PhotoGeometry.pose(camera:frame.camera.transform,root:rootMatrix,context:context)
+            let display=frame.displayTransform(for:orientation,viewportSize:viewSize)
+            let fresh=ProcessInfo.processInfo.systemUptime-frame.timestamp
+            let normal:Bool
+            if case .normal=frame.camera.trackingState { normal=true } else { normal=false }
+            var issues:[String]=[]
+            if !normal { issues.append("tracking_not_normal") }
+            if fresh<0 || fresh>0.5 { issues.append("frame_not_fresh") }
+            if context.alignmentRevision<=photoAlignmentRevisionAtReset { issues.append("alignment_not_adjusted_since_AR_reset") }
+            if context.settings.datum == .unknown { issues.append("geodetic_datum_unknown") }
+            if context.origin == nil { issues.append("diagram_origin_unknown") }
+            if pose == nil { issues.append("invalid_transform") }
+            let epoch=observationEpoch
+            let capturedAt=Date().addingTimeInterval(-max(0,min(1,fresh)))
+            var record=PhotoCaptureRecord(id:UUID(),mode:photoMode,capturedAt:capturedAt,frameTimestamp:frame.timestamp,followingFrameTimestamp:nil,sessionID:photoSessionID,tracking:String(describing:frame.camera.trackingState),synchronization:photoMode == .cameraOnly ? "same_ARFrame_image_and_pose" : "asynchronous_snapshot_bracket",georeferenceUsable:issues.isEmpty,issues:issues,context:context,pose:pose,rootToARWorld:DiagramTransform.values(rootMatrix),rawCameraToARWorld:DiagramTransform.values(frame.camera.transform),followingRawCameraToARWorld:nil,rawImageWidth:Int(frame.camera.imageResolution.width),rawImageHeight:Int(frame.camera.imageResolution.height),intrinsicsColumnMajor:(0..<3).flatMap { column in (0..<3).map { Double(frame.camera.intrinsics[column][$0]) } },interfaceOrientation:String(orientation.rawValue),displayTransform:[Double(display.a),Double(display.b),Double(display.c),Double(display.d),Double(display.tx),Double(display.ty)])
+            let rotation=PhotoGeometry.imageRotation(a:Double(display.a),b:Double(display.b))
+            record.rawToOutputExifRotation=rotation
+            record.positionSource=photoSource
+            record.arPoseUsable=normal && fresh>=0 && fresh<=0.5 && pose != nil
+            record.arGeoreferenceUsable=record.arPoseUsable && issues.isEmpty
+            // Keep raw sensor observations even when they are stale or unselected.
+            let deviceDirection=normal && fresh>=0 && fresh<=0.5 ? PhotoGeometry.deviceCameraDirection(heading:photoDeviceHeading,portraitCamera:simd_inverse(frame.camera.viewMatrix(for:.portrait)),date:capturedAt) : nil
+            record.deviceObservation=DevicePhotoObservation(location:photoDeviceLocation,heading:photoDeviceHeading,cameraDirectionDegrees:deviceDirection?.degrees,cameraDirectionReference:deviceDirection?.reference)
+            record.deviceCameraDirectionUsable=deviceDirection != nil
+            record.outputCameraToDiagram=pose.map { PhotoGeometry.outputCameraToDiagram(raw:$0.cameraToDiagram,rotation:rotation) }
+            record.updateSelectedValidity()
+            if photoMode == .cameraOnly {
+                let imageOrientation=CGImagePropertyOrientation(rawValue:rotation)!
+                let buffer=frame.capturedImage
+                DispatchQueue.global(qos:.userInitiated).async {
+                    let result=Result { try PhotoArchive.cameraImage(buffer,orientation:imageOrientation) }
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self,self.activePhotoCaptureRequestID==requestID else { return }
+                        switch result {
+                        case .success(let image): self.archiveAndSavePhoto(image,record:record,requestID:requestID)
+                        case .failure(let error):self.completePhotoCapture(requestID:requestID,success:false,message:"写真を作成できませんでした：\(error.localizedDescription)")
+                        }
+                    }
+                }
+                return
+            }
 
             arView.snapshot(saveToHDR: false) { [weak self] image in
                 DispatchQueue.main.async {
@@ -1552,14 +2211,20 @@ struct ARRendererView: UIViewRepresentable {
                         return
                     }
 
+                    if let after=arView.session.currentFrame {
+                        record.followingFrameTimestamp=after.timestamp
+                        record.followingRawCameraToARWorld=DiagramTransform.values(after.camera.transform)
+                        record.followingRootToARWorld=DiagramTransform.values(root.transformMatrix(relativeTo:nil))
+                        let sameRoot=zip(record.rootToARWorld,DiagramTransform.values(root.transformMatrix(relativeTo:nil))).allSatisfy { abs($0-$1)<0.00001 }
+                        let stable=PhotoGeometry.stable(before:frame.camera.transform,after:after.camera.transform,seconds:after.timestamp-frame.timestamp)
+                        if !stable || !sameRoot || epoch != self.observationEpoch || record.sessionID != self.photoSessionID {
+                            record.arPoseUsable=false;record.arGeoreferenceUsable=false;record.deviceCameraDirectionUsable=false;record.issues.append("snapshot_pose_or_alignment_changed")
+                        }
+                        record.synchronization=stable && sameRoot ? "snapshot_bracket_stationary_estimate_not_exact_frame" : "snapshot_frame_unresolved"
+                    } else { record.arPoseUsable=false;record.arGeoreferenceUsable=false;record.deviceCameraDirectionUsable=false;record.issues.append("snapshot_following_frame_missing") }
+                    record.updateSelectedValidity()
                     let composite = self.compositeImage(image, labels: labels, viewSize: viewSize)
-                    self.notifyPhotoCaptureSaving(requestID)
-                    self.schedulePhotoCaptureWatchdog(
-                        for: requestID,
-                        after: 15,
-                        message: "写真アプリへの保存が時間内に完了しませんでした。もう一度お試しください"
-                    )
-                    self.savePhotoToLibrary(composite, requestID: requestID)
+                    self.archiveAndSavePhoto(composite,record:record,requestID:requestID)
                 }
             }
         }
@@ -1589,7 +2254,7 @@ struct ARRendererView: UIViewRepresentable {
 
             Task { @MainActor [uiBridge] in
                 if success {
-                    uiBridge.photoCaptureSucceeded(requestID)
+                    uiBridge.photoCaptureSucceeded(requestID,message:message)
                 } else {
                     uiBridge.photoCaptureFailed(requestID, message: message)
                 }
@@ -1667,19 +2332,36 @@ struct ARRendererView: UIViewRepresentable {
             }
         }
 
-        private func savePhotoToLibrary(_ image: UIImage, requestID: Int) {
+        private func archiveAndSavePhoto(_ image:UIImage,record:PhotoCaptureRecord,requestID:Int) {
+            notifyPhotoCaptureSaving(requestID)
+            schedulePhotoCaptureWatchdog(for:requestID,after:20,message:"写真の保存が時間内に完了しませんでした。撮影記録を確認してください")
+            DispatchQueue.global(qos:.userInitiated).async {
+                let result=Result { try PhotoArchive.save(image,record:record) }
+                DispatchQueue.main.async { [weak self] in
+                    guard let self,self.activePhotoCaptureRequestID==requestID else { return }
+                    switch result {
+                    case .success(let package):self.savePhotoToLibrary(package,requestID:requestID)
+                    case .failure(let error):self.completePhotoCapture(requestID:requestID,success:false,message:"撮影記録を保存できませんでした：\(error.localizedDescription)")
+                    }
+                }
+            }
+        }
+        private func savePhotoToLibrary(_ package:PhotoArchive.Package, requestID: Int) {
             guard activePhotoCaptureRequestID == requestID else { return }
             PHPhotoLibrary.shared().performChanges {
-                PHAssetChangeRequest.creationRequestForAsset(from: image)
+                let request=PHAssetCreationRequest.forAsset()
+                let options=PHAssetResourceCreationOptions();options.originalFilename=package.record.imageFileName
+                request.creationDate=package.record.capturedAt
+                request.addResource(with:.photo,data:package.jpeg,options:options)
             } completionHandler: { [weak self] success, error in
                 DispatchQueue.main.async {
                     guard let self,
                           self.activePhotoCaptureRequestID == requestID else { return }
                     let message: String
                     if success {
-                        message = "AR写真を写真アプリへ保存しました"
+                        message = package.record.selectedPositionUsable ? "写真と撮影座標を保存しました" : "写真を保存・撮影座標は確認待ち"
                     } else {
-                        message = "AR写真の保存エラー：\(error?.localizedDescription ?? "不明なエラー")"
+                        message = "撮影記録は端末内に保存済みです。写真アプリへの保存エラー：\(error?.localizedDescription ?? "不明なエラー")"
                     }
                     self.completePhotoCapture(requestID: requestID, success: success, message: message)
                 }
@@ -1758,6 +2440,44 @@ struct ARRendererView: UIViewRepresentable {
                 )
             }
 
+            // Segment differences use saved metre coordinates; root alignment is rigid yaw/translation.
+            var occupied: [CGPoint] = []
+            for distance in drawingDistances {
+                let world = root.convert(position:distance.midpoint,to:nil)
+                guard simd_dot(world-cameraPosition,cameraForward)>0.05,
+                      let point=arView.project(world), point.x.isFinite, point.y.isFinite,
+                      arView.bounds.contains(point) else { continue }
+                let text = distance.text(in:drawingDistanceMode)
+                let textWidth = (text as NSString).size(withAttributes:[.font:UIFont.preferredFont(forTextStyle:.caption2)]).width + 14
+                let margin = min(textWidth/2,arView.bounds.width/2)
+                let position = CGPoint(x:max(margin,min(arView.bounds.width-margin,point.x)),y:point.y)
+                guard !occupied.contains(where:{ hypot($0.x-position.x,$0.y-position.y)<45 }) else { continue }
+                projected.append(ScreenLabel(id:distance.id,text:text,x:position.x,y:position.y,distance:distance.metres,screenYOffset:0,opacity:labelOpacityByID[distance.id] ?? 1))
+                occupied.append(position)
+                if occupied.count >= 40 { break }
+            }
+
+            var treeLabelCount=0
+            // Stage feedback wins the label budget over nearby saved records and scale ticks.
+            for label in treeDirectionLabels+treeExtraLabels {
+                let world=root.convert(position:label.position,to:nil)
+                guard simd_dot(world-cameraPosition,cameraForward)>0.05,let point=arView.project(world),arView.bounds.contains(point),treeLabelCount<TreeDisplayBudget.maximumLabels else {continue}
+                projected.append(ScreenLabel(id:label.id,text:label.text,x:point.x,y:point.y,distance:simd_length(world-cameraPosition),screenYOffset:-18,opacity:1));treeLabelCount+=1
+            }
+            for tree in treeLabels {
+                let world=root.convert(position:tree.position,to:nil)
+                guard simd_dot(world-cameraPosition,cameraForward)>0.05,
+                      let point=arView.project(world),arView.bounds.contains(point),treeLabelCount<TreeDisplayBudget.maximumLabels else {continue}
+                projected.append(ScreenLabel(id:tree.id,text:tree.color.title+" "+tree.number+((tree.radius.isFinite && tree.radius>0) ? String(format:"\n直径 %.1f cm",Double(tree.radius)*200):"\n直径 未測定"),x:point.x,y:point.y,distance:simd_length(world-cameraPosition),screenYOffset:-12,opacity:1,maximumLines:2));treeLabelCount+=1
+            }
+
+            for marker in treeMarkerLabels where treeLabelCount<TreeDisplayBudget.maximumLabels {
+                let world=root.convert(position:marker.position,to:nil)
+                guard simd_dot(world-cameraPosition,cameraForward)>0.05,
+                      let point=arView.project(world),arView.bounds.contains(point) else {continue}
+                projected.append(ScreenLabel(id:marker.id,text:String(marker.number),x:point.x,y:point.y,distance:simd_length(world-cameraPosition),screenYOffset:-22,opacity:1));treeLabelCount+=1
+            }
+
             if projected != lastProjectedLabels {
                 lastProjectedLabels = projected
                 Task { @MainActor [uiBridge] in
@@ -1790,7 +2510,28 @@ struct ARRendererView: UIViewRepresentable {
             // pause直後にキュー済みのフレームが届いても、読込・設定・地図表示中は
             // 方位、深度、ラベルを一切更新しない。
             guard isSessionActive else { return }
+            MainActor.assumeIsolated {
+                if let input=scanInput,input.isRecording,let view=arView {
+                    if let model=uiBridge.model,!model.arCameraActive || model.treeSurvey.active || model.drawing.active || model.drawingSelectionMode {
+                        scanCapture?.stop(reason:"他の測定モード")
+                    } else {
+                        let orientation=view.window?.windowScene?.interfaceOrientation ?? .unknown
+                        if let snapshot=GCPARFrameAdapter.snapshot(frame,viewport:view.bounds.size,orientation:orientation) {
+                            scanCapture?.receive(snapshot) {
+                                try ScanLiveAdapter.capture(frame,snapshot:snapshot,limits:scanCapture?.limits ?? ScanLimits())
+                            }
+                        } else {input.cancelRequest(reason:.viewChanged)}
+                    }
+                }
+                if let capture=scanCapture,let view=arView {capture.synchronizePreviewContext();scanPreviewRenderer.update(capture,view:view,frame:frame)}
+                if let model=uiBridge.model {updateTreeDisplay(model:model)}
+            }
             hasReceivedActiveFrame = true
+            let normal: Bool
+            if case .normal = frame.camera.trackingState { normal = true } else { normal = false }
+            Task { @MainActor in self.updateDrogger(using:frame,normal:normal) }
+            let depthReady = requestedLiDAREnabled && normal && frame.sceneDepth?.confidenceMap != nil
+            Task { @MainActor [uiBridge] in uiBridge.model?.reportLiDARDepth(depthReady) }
 
             if let requestID = activePhotoCaptureRequestID,
                photoCaptureInProgress,
@@ -1808,6 +2549,9 @@ struct ARRendererView: UIViewRepresentable {
         }
 
         func session(_ session: ARSession, didFailWithError error: Error) {
+            MainActor.assumeIsolated {scanCapture?.stop(reason:"ARセッション中断");scanCapture?.invalidatePreview()}
+            observationEpoch += 1
+            Task { @MainActor [uiBridge] in uiBridge.model?.reportLiDARDepth(false); uiBridge.model?.drogger.suspendAR() }
             let message = error.localizedDescription
 
             // gravityAndHeading が端末状態・方位センサー状態によって失敗した場合でも、
@@ -1829,6 +2573,10 @@ struct ARRendererView: UIViewRepresentable {
         }
 
         func sessionWasInterrupted(_ session: ARSession) {
+            MainActor.assumeIsolated {scanCapture?.stop(reason:"ARセッション中断");scanCapture?.invalidatePreview()}
+            Task { @MainActor [uiBridge] in uiBridge.model?.reportLiDARDepth(false); uiBridge.model?.drogger.suspendAR() }
+            observationEpoch += 1
+            Task { @MainActor in self.clearObservation(); self.uiBridge.model?.treeSurvey.invalidateObservations("AR追跡が変わりました") }
             setARStatus("AR一時停止中")
         }
 
@@ -1840,6 +2588,10 @@ struct ARRendererView: UIViewRepresentable {
         }
 
         func session(_ session: ARSession, cameraDidChangeTrackingState camera: ARCamera) {
+            MainActor.assumeIsolated {
+                scanInput?.trackingChanged(GCPARFrameAdapter.tracking(camera.trackingState))
+                if let capture=scanCapture,let view=arView {capture.synchronizePreviewContext();scanPreviewRenderer.update(capture,view:view,frame:view.session.currentFrame)}
+            }
             let lidarText = requestedLiDAREnabled ? " / LiDAR補助" : ""
             switch camera.trackingState {
             case .normal:
@@ -1849,8 +2601,14 @@ struct ARRendererView: UIViewRepresentable {
                     setARStatus("AR追跡中\(lidarText)")
                 }
             case .notAvailable:
+                Task { @MainActor [uiBridge] in uiBridge.model?.reportLiDARDepth(false); uiBridge.model?.drogger.suspendAR() }
+                observationEpoch += 1
+                Task { @MainActor in self.clearObservation(); self.uiBridge.model?.treeSurvey.invalidateObservations("AR追跡が変わりました") }
                 setARStatus("AR追跡不可")
             case .limited(let reason):
+                Task { @MainActor [uiBridge] in uiBridge.model?.reportLiDARDepth(false); uiBridge.model?.drogger.suspendAR() }
+                observationEpoch += 1
+                Task { @MainActor in self.clearObservation(); self.uiBridge.model?.treeSurvey.invalidateObservations("AR追跡が変わりました") }
                 switch reason {
                 case .initializing:
                     setARStatus("AR初期化中")

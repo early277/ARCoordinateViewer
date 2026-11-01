@@ -2,6 +2,8 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Drogger受信機に接続し、試験的なAR水平位置補正にGNSS位置を利用します。</string>
     <key>CFBundleDevelopmentRegion</key>
     <string>$(DEVELOPMENT_LANGUAGE)</string>
     <key>CFBundleExecutable</key>
@@ -21,11 +23,15 @@
     <key>ITSAppUsesNonExemptEncryption</key>
     <false/>
     <key>NSCameraUsageDescription</key>
-    <string>AR表示のためにカメラを使用します。</string>
+    <string>AR表示、点群・樹木の計測、写真・動画の撮影にカメラを使用します。</string>
     <key>NSLocationWhenInUseUsageDescription</key>
-    <string>初期位置および手動更新時の現在地取得に使用します。</string>
+    <string>ARの基準位置、地図表示、GPSを選択した写真の撮影位置に使用します。</string>
     <key>NSPhotoLibraryAddUsageDescription</key>
-    <string>AR要素とカメラ映像を合成した写真を写真アプリへ保存するために使用します。</string>
+    <string>カメラ写真やAR図面付き写真と、その撮影位置情報を写真アプリへ保存するために使用します。</string>
+    <key>UIFileSharingEnabled</key>
+    <true/>
+    <key>LSSupportsOpeningDocumentsInPlace</key>
+    <true/>
     <key>UILaunchStoryboardName</key>
     <string>LaunchScreen</string>
     <key>UIRequiresFullScreen</key>

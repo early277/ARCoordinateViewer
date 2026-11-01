@@ -1,7 +1,30 @@
+# Local files and Xcode state
 .DS_Store
 DerivedData/
 build/
 *.xcuserstate
-**/xcuserdata/
-*.xccheckout
-*.xcscmblueprint
+xcuserdata/
+.swiftpm/
+# Credentials and signing files
+.env
+.env.*
+*.p8
+*.p12
+*.pem
+*.key
+*.mobileprovision
+*.provisionprofile
+# Local artifacts and records
+*.xcarchive/
+*.ipa
+*.dSYM/
+*.dSYM.zip
+Validation/
+Release/
+Backups/
+PointCloudRecords/
+ScanCaptures/
+Exports/
+.codex/
+.agents/
+.aws/

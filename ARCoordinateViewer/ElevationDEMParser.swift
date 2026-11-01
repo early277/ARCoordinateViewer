@@ -664,7 +664,7 @@ private final class GSIDEMXMLDelegate: NSObject, XMLParserDelegate {
     }
 }
 
-private struct DEMZIPEntry {
+struct DEMZIPEntry {
     var name: String
     var generalPurposeFlag: UInt16
     var compressionMethod: UInt16
@@ -674,7 +674,7 @@ private struct DEMZIPEntry {
     var localHeaderOffset: Int
 }
 
-private struct DEMZIPArchive {
+struct DEMZIPArchive {
     private static let maximumEntries = 512
     // 現行の1m DEM ZIPは複数XMLを含み、圧縮後のファイルサイズより展開後が
     // 大きくなる。1mの通常配布データを扱えるようにしつつ、異常な圧縮爆弾は

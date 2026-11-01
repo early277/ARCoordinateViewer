@@ -6,7 +6,7 @@ import CoreGraphics
 struct GeoTIFFParser {
     static let maxTextureDimension = 2048
 
-    static func parse(data: Data, fileName: String, coordinateMode: GeoTIFFCoordinateMode) throws -> GeoRaster {
+    static func parse(data: Data, fileName: String, coordinateMode: GeoTIFFCoordinateMode, progress: (Double) -> Void = { _ in }, cancelled: () -> Bool = { false }) throws -> GeoRaster {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil) else {
             throw GeoTIFFError.notImage
         }
@@ -21,20 +21,11 @@ struct GeoTIFFParser {
         let metadata = TIFFMetadata(data: data)
         let corners = try makeGeoCorners(metadata: metadata, imageWidth: sourceWidth, imageHeight: sourceHeight, coordinateMode: coordinateMode)
 
-        let maxPixel = min(maxTextureDimension, max(sourceWidth, sourceHeight))
-        let options: [CFString: Any] = [
-            kCGImageSourceCreateThumbnailFromImageAlways: true,
-            kCGImageSourceThumbnailMaxPixelSize: maxPixel,
-            kCGImageSourceCreateThumbnailWithTransform: true
-        ]
+        let tileStore = try RasterTileStore.build(data: data, source: source, width: sourceWidth, height: sourceHeight, corners: corners, progress: progress, cancelled: cancelled)
 
-        guard let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
-            throw GeoTIFFError.imageDecodeFailed
-        }
-
-        let renderedWidth = thumbnail.width
-        let renderedHeight = thumbnail.height
-        let image = UIImage(cgImage: thumbnail)
+        let image = try tileStore.overview(maxDimension: maxTextureDimension)
+        let renderedWidth = Int(image.size.width)
+        let renderedHeight = Int(image.size.height)
         let downsampleNote: String
         if sourceWidth != renderedWidth || sourceHeight != renderedHeight {
             downsampleNote = " / 画像縮小：\(sourceWidth)x\(sourceHeight)→\(renderedWidth)x\(renderedHeight)"
@@ -50,7 +41,8 @@ struct GeoTIFFParser {
             sourcePixelHeight: sourceHeight,
             renderedPixelWidth: renderedWidth,
             renderedPixelHeight: renderedHeight,
-            notes: "不透明度35%初期値 / 画素透過処理なし\(downsampleNote)"
+            notes: "原寸タイル・\(tileStore.levels.count)段階 / プレビュー\(downsampleNote)",
+            tileStore: tileStore
         )
     }
 

@@ -43,8 +43,8 @@ enum CoordinateConverter {
     }
 
     static func enuMeters(from coord: GeoCoordinate, origin: GeoCoordinate) -> (east: Double, north: Double, up: Double) {
-        let target = geodeticToECEF(latitude: coord.latitude, longitude: coord.longitude, altitude: coord.altitude ?? 0)
-        let base = geodeticToECEF(latitude: origin.latitude, longitude: origin.longitude, altitude: origin.altitude ?? 0)
+        let target = geodeticToECEF(latitude: coord.latitude, longitude: coord.longitude, altitude: 0)
+        let base = geodeticToECEF(latitude: origin.latitude, longitude: origin.longitude, altitude: 0)
 
         let dx = target.x - base.x
         let dy = target.y - base.y

@@ -17,6 +17,18 @@ enum SIMAParserError: LocalizedError {
     }
 }
 
+/// Positional A01 fields shared by the existing map import and the reviewed
+/// control-point table. No inference from trailing numeric cells is made here.
+struct SIMACoordinateFields {
+    var number:String;var name:String;var x:String;var y:String;var height:String
+    init?(_ row:[String]) {
+        guard row.count>=5,row[0].trimmingCharacters(in:.whitespacesAndNewlines).uppercased()=="A01" else {return nil}
+        number=row[1].trimmingCharacters(in:.whitespacesAndNewlines)
+        name=row[2].trimmingCharacters(in:.whitespacesAndNewlines)
+        x=row[3].trimmingCharacters(in:.whitespacesAndNewlines);y=row[4].trimmingCharacters(in:.whitespacesAndNewlines)
+        height=row.count>=6 ? row[5].trimmingCharacters(in:.whitespacesAndNewlines):""
+    }
+}
 enum SIMAParser {
     private struct SIMAPoint {
         var aliases: [String]
@@ -107,12 +119,9 @@ enum SIMAParser {
 
         // 一般的なSIMA座標行：A01,点番号,点名,X,Y,Z
         // 点番号・点名が数字だけの場合でも、X/Yを誤認しないように列位置を優先する。
-        if row.count >= 5,
-           let x = Double(row[3].trimmingCharacters(in: .whitespacesAndNewlines)),
-           let y = Double(row[4].trimmingCharacters(in: .whitespacesAndNewlines)) {
-            let z = row.count >= 6 ? Double(row[5].trimmingCharacters(in: .whitespacesAndNewlines)) : nil
-            let pointNumber = row.count >= 2 ? row[1].trimmingCharacters(in: .whitespacesAndNewlines) : ""
-            let pointName = row.count >= 3 ? row[2].trimmingCharacters(in: .whitespacesAndNewlines) : ""
+        if let fields=SIMACoordinateFields(row),let x=Double(fields.x),let y=Double(fields.y) {
+            let z=Double(fields.height)
+            let pointNumber=fields.number,pointName=fields.name
             let name = pointName.isEmpty ? (pointNumber.isEmpty ? "SIMA点" : pointNumber) : pointName
 
             var coord = try JapanesePlaneRectangularSystem.toGeodetic(system: defaultPlaneSystem, x: x, y: y)

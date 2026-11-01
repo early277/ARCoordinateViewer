@@ -14,7 +14,7 @@ enum GeoTIFFImportPurpose: Hashable {
     }
 }
 
-enum ElevationCoordinateReference: Hashable {
+enum ElevationCoordinateReference: Hashable, Codable {
     case geographic
     case planeRectangular(system: Int)
 
@@ -32,7 +32,7 @@ enum ElevationCoordinateReference: Hashable {
 ///
 /// modelX = originX + columnX * column + rowX * row
 /// modelY = originY + columnY * column + rowY * row
-struct ElevationGridTransform: Hashable {
+struct ElevationGridTransform: Hashable, Codable {
     var originX: Double
     var originY: Double
     var columnX: Double
@@ -59,8 +59,8 @@ struct ElevationGridTransform: Hashable {
     }
 }
 
-struct ElevationGrid: Identifiable {
-    let id = UUID()
+struct ElevationGrid: Identifiable, Codable {
+    var id = UUID()
     var name: String
     var width: Int
     var height: Int

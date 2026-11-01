@@ -1,6 +1,8 @@
 import Foundation
+import MapKit
 import CoreLocation
 import simd
+import ARKit
 
 /// AR写真の撮影処理をUIへ伝える状態。
 /// 要求IDは `photoCaptureRequestID` で別に管理し、古い非同期コールバックが
@@ -31,30 +33,423 @@ struct HorizontalScreenBasis: Equatable, Sendable {
     var forwardNorth: Double
 }
 
+struct ARControlPanels {
+    var drawing = false
+    var distance = false
+    var details = false
+    var hidden = false
+}
+
 @MainActor
 final class AppModel: ObservableObject {
+    let drogger = DroggerReceiver()
+    let treeSurvey: TreeSurveyController
+    let scanCapture:ScanCaptureController
+    var scanInput:GCPInputSession {scanCapture.input}
+    var scanFeatureAvailable:Bool {ScanFeatureAvailability.isEnabled}
+    var scanModeActive:Bool {scanFeatureAvailable && scanCapture.modeOpen}
+    var scanSupported:Bool {ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) && ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth)}
+    func openScanCapture() {
+        guard scanFeatureAvailable,canEditWork,arCameraActive,!treeSurvey.active,!drawing.active,!drawingSelectionMode else {return}
+        scanCapture.modeOpen=true;scanCapture.discover()
+    }
+    @discardableResult func beginScanInput() -> Bool {
+        guard scanFeatureAvailable,canEditWork,arCameraActive,!treeSurvey.active,!drawing.active,!drawingSelectionMode else {return false}
+        guard scanSupported else {return false}
+        scanCapture.beginExplicit();return scanInput.isRecording
+    }
     static let defaultDisplayPlaneOffsetMeters = -1.0
+    static let defaultDrawingLineWidth = 0.008
+    @Published var drawing = DrawingState() { didSet { if drawingSnapIndicator != nil {drawingSnapIndicator=nil};saveWork() } }
+    @Published var drawingObservationResetID = 0
+    @Published var drawingHasObservation = false
+    @Published private(set) var drawingSnapEnabled = true
+    @Published private(set) var drawingSnapIndicator:DrawingSnapIndicator?
+    func setDrawingSnapEnabled(_ enabled:Bool) {
+        guard canEditWork,drawing.active,enabled != drawingSnapEnabled else {return}
+        cancelPendingDrawingCapture()
+        // Keep an existing first sight: changing snap mode cannot silently change its target.
+        drawingSnapEnabled=enabled;drawingSnapIndicator=nil
+        UserDefaults.standard.set(enabled,forKey:"ARCoordinateViewer.DrawingSnapEnabled")
+        drawingMessage=drawingHasObservation ? "視線1/2・横へ移動（スナップ"+(enabled ? "ON":"OFF")+"）" : (enabled ? "スナップON・図形の点と線上に吸着":"スナップOFF・照準の実物を測定")
+    }
+    func reportDrawingSnap(_ indicator:DrawingSnapIndicator?) {
+        if drawingSnapIndicator != indicator {drawingSnapIndicator=indicator}
+    }
+    @Published private(set) var drawingConfirmation=DrawingConfirmation()
+    @Published private(set) var drawingLineSave=DrawingLineSave()
+    @Published private(set) var drawingLineSaveFailed=false
+    var drawingSavePending:Bool {drawingLineSave.pending}
+    var canSaveDrawingLine:Bool {canEditWork && drawing.canFinish && !drawingCapturePending}
+    var drawingCapturePending:Bool {drawingConfirmation.pending}
+    var drawingCaptureRequestID:Int {drawingConfirmation.id}
+    var canRequestDrawingCapture:Bool {canEditWork && (drawing.active || drawingSelectionMode) && !treeSurvey.active && !drawingCapturePending}
+    func requestDrawingCapture() {guard canRequestDrawingCapture else {return};drawingConfirmation.request()}
+    func finishDrawingCapture(_ id:Int) {drawingConfirmation.finish(id)}
+    private func cancelPendingDrawingCapture() {drawingConfirmation.cancel()}
+    @Published var drawingMessage = "照準に変化点を合わせて点を追加"
+    @Published var drawingSelectionMode = false
+    @Published var selectedDrawingID: UUID?
+    @Published var drawingLineWidth = AppModel.defaultDrawingLineWidth { didSet { saveWork() } }
+    // Preserve the initial point size when changing the default line width.
+    // Existing work keeps its original point/line ratio across upgrades.
+    @Published private(set) var drawingPointReferenceWidth = AppModel.defaultDrawingLineWidth
+    @Published private(set) var drawingExportProfiles: [String:DrawingExportProfile] = [:]
+    @Published private(set) var drawingExportDocument: String?
+    @Published var workNeedsRealignment = false
+    @Published private(set) var workRecoveredFromPreviousGeneration = false
+    @Published private(set) var workSaveMessage = ""
+    private var workReady = false
+    private var libraryRevision = 0
+    private var saveSequence = 0
+    private var drawingVerticalDatum: Double?
+    @Published private(set) var isRestoringWork = false
+    var canEditWork: Bool { workReady && !isRestoringWork && !drawingSavePending }
+    private struct DrawingAlignmentSnapshot {
+        var origin: GeoCoordinate?
+        var heading: Double; var east: Double; var north: Double
+        var height: Double; var committedHeight: Double
+    }
+    private var drawingAlignment: DrawingAlignmentSnapshot?
+    private func captureDrawingAlignment() {
+        drawingAlignment = DrawingAlignmentSnapshot(origin:origin,heading:headingOffsetDegrees,east:planePanEastMeters,north:planePanNorthMeters,height:displayPlaneOffsetMeters,committedHeight:committedVerticalDisplayOffsetMeters)
+    }
+    private let workStore: WorkPersistence
+    private lazy var workSaver = WorkSaveQueue(store:workStore)
+
+    var drawingExportReferences: [DXFCoordinateReference] {
+        var seen = Set<DXFCoordinateReference>()
+        return layers.compactMap(\.dxfReference).filter { seen.insert($0).inserted }
+    }
+    func drawingExportSourceName(_ reference:DXFCoordinateReference) -> String {
+        layers.first { $0.dxfReference==reference }?.name.components(separatedBy:" / ").first ?? "元図面"
+    }
+    var drawingExportDatum: Double? { drawingVerticalDatum }
+    func exportDrawingDXF(reference: DXFCoordinateReference, heightDatum: Double?, planar: Bool) throws -> Data {
+        guard canEditWork else { throw DXFDrawingExport.Failure(message:"復元完了を待ってください") }
+        guard let origin else { throw DXFDrawingExport.Failure(message:"立ち位置が未設定です") }
+        return try DXFDrawingExport.encode(paths:drawing.completed+[drawing.draft],origin:origin,reference:reference,heightDatum:heightDatum,planar:planar)
+    }
+
+    func undoDrawing() {
+        guard canEditWork,drawing.active else {return}
+        cancelPendingDrawingCapture();drawingObservationResetID += 1;drawingHasObservation=false
+        let count=drawing.draft.points.count;drawing.undo();drawingLineSaveFailed=false
+        drawingMessage=count>0 ? "入力を1点戻しました":"戻す入力点はありません"
+    }
+    func clearDrawingInput() {
+        guard canEditWork,drawing.active else {return}
+        cancelPendingDrawingCapture();drawingObservationResetID += 1;drawingHasObservation=false
+        drawing.clearInput(continueDrawing:true);drawingLineSaveFailed=false;captureDrawingAlignment()
+        drawingMessage="入力をクリア・次の点を追加できます"
+    }
+    func cancelDrawing() {
+        guard canEditWork,drawing.active else {return}
+        cancelPendingDrawingCapture();drawingObservationResetID += 1;drawingHasObservation=false
+        drawing.clearInput(continueDrawing:false);drawingLineSaveFailed=false
+        drawingMessage="作図をやめました・保存済みは保持"
+    }
+    func finishDrawing() {
+        guard canEditWork,drawing.active else {return}
+        guard !drawingCapturePending else {drawingMessage="点の取得完了を待ってください";return}
+        guard let request=drawingLineSave.begin(drawing) else {drawingMessage=drawing.draft.isPointCollection ? "1点以上を追加してください":"線の保存には2点以上必要です";return}
+        cancelPendingDrawingCapture();drawingObservationResetID += 1;drawingHasObservation=false
+        drawingLineSaveFailed=false;drawingMessage="入力点列を保存中"
+        enqueueWork(drawingState:request.committed) { [weak self] result in
+            guard let self else {return}
+            let success:Bool;if case .success=result {success=true}else {success=false}
+            guard let next=self.drawingLineSave.resolve(request.id,succeeded:success) else {return}
+            self.drawing=next
+            self.synchronizeDrawingVerticalDatum()
+            self.drawingLineSaveFailed = !success
+            self.captureDrawingAlignment()
+            self.drawingMessage=success ? "保存済みに追加・次の点を追加できます":"保存失敗・入力点列を保持しています。保存を再試行"
+        }
+    }
+    func resumeDrawing() {
+        guard canEditWork, !drawing.active else { return }
+        drawingSelectionMode=false; selectedDrawingID=nil
+        captureDrawingAlignment()
+        drawing.resume()
+        cancelPendingDrawingCapture();drawingMessage="線を再開・照準を合わせて点を追加"
+    }
+    func startDrawing(kind:DrawingKind = .line) {
+        guard !treeSurvey.active else { drawingMessage="樹木調査を終了してから作図してください";return }
+        guard canEditWork, !drawing.active else { return }
+        drawingSelectionMode=false; selectedDrawingID=nil
+        captureDrawingAlignment()
+        drawing.start(kind:kind)
+        cancelPendingDrawingCapture();drawingMessage = "照準を合わせて点を追加"
+    }
+    func selectDrawingLayer(_ id:UUID) {
+        guard canEditWork, id != drawing.currentLayerID else { return }
+        guard !drawing.active || drawing.draft.points.isEmpty else {drawingMessage="線を保存するか入力をクリアしてからレイヤーを変更してください";return}
+        drawing.selectLayer(id)
+        drawingObservationResetID += 1; drawingHasObservation=false
+        selectedDrawingID=nil; drawingSelectionMode=false
+        cancelPendingDrawingCapture();drawingMessage="\(drawing.currentLayerName)・照準で確定"
+    }
+    func addDrawingLayer(name:String) {
+        guard canEditWork else { return }
+        guard !drawing.active || drawing.draft.points.isEmpty else {drawingMessage="線を保存するか入力をクリアしてからレイヤーを追加してください";return}
+        drawing.addLayer(name:name)
+        drawingObservationResetID += 1; drawingHasObservation=false
+        selectedDrawingID=nil; drawingSelectionMode=false
+        cancelPendingDrawingCapture();drawingMessage="\(drawing.currentLayerName)に切り替えました"
+    }
+    func deleteDrawingPaths(all:Bool) {
+        guard canEditWork, !drawing.active else { return }
+        drawing.deletePaths(in:all ? nil : drawing.currentLayerID)
+        selectedDrawingID=nil
+        drawingMessage=all ? "全作図を削除・戻すで復元" : "レイヤーの作図を削除・戻すで復元"
+    }
+    func addDrawingPoint(_ point:SIMD3<Float>, sourceAltitude:Double? = nil, altitudeSource:DrawingElevationSource = .sourceDrawing) {
+        guard canEditWork, drawing.active, point.x.isFinite, point.y.isFinite, point.z.isFinite else { return }
+        let exact=sourceAltitude.flatMap { $0.isFinite ? $0 : nil }
+        let estimate=drawingCaptureDatum.map { $0+Double(point.y) }
+        drawing.draft.append(point,elevation:exact ?? estimate,source:exact != nil ? altitudeSource : (estimate != nil ? .arEstimate : nil))
+        drawingLineSaveFailed=false
+    }
+    var drawingCaptureDatum:Double? {
+        if settings.useRelativeAltitude { return drawingVerticalDatum }
+        if let height=origin?.drawingSourceAltitude, height.isFinite { return height }
+        // A constant-height CAD plane also gives an explicit display datum. Mixed
+        // heights flattened for display cannot supply one, so remain unknown.
+        let sources=layers.filter { $0.isVisible && $0.dxfReference != nil }
+        guard let first=sources.first?.constantDXFAltitude,
+              sources.allSatisfy({ $0.constantDXFAltitude == first }) else { return nil }
+        return first
+    }
+    func beginDrawingSelection() {
+        guard canEditWork, !drawing.active else { return }
+        drawingSelectionMode=true; selectedDrawingID=nil
+        drawingMessage="消す作図を照準で選択"
+    }
+    func endDrawingSelection() { drawingSelectionMode=false; selectedDrawingID=nil }
+    func selectDrawing(_ id:UUID?) {
+        guard drawingSelectionMode, !drawing.active else { return }
+        selectedDrawingID=id.flatMap { value in drawing.currentPaths.contains { $0.id==value } ? value : nil }
+        if let path=drawing.completed.first(where:{ $0.id==selectedDrawingID }) {
+            drawingMessage=path.points.count==1 ? "点を選択" : "線全体（\(path.points.count)点）を選択"
+        } else { drawingMessage="消す作図を照準で選択" }
+    }
+    func deleteSelectedDrawing() {
+        guard canEditWork, drawingSelectionMode, let id=selectedDrawingID else { return }
+        drawing.delete(id:id); selectedDrawingID=nil; drawingMessage="削除しました"
+    }
+    func undoDrawingDeletion() {
+        guard canEditWork, !drawing.active else { return }
+        if let id=drawing.undoDeletion() {
+            if drawingSelectionMode { selectedDrawingID=id }
+            drawingMessage="削除を戻しました"
+        }
+    }
+    func setDrawingLineWidth(_ value:Double) {
+        guard value.isFinite else { return }
+        let width=max(0.004,min(0.08,value))
+        if drawingLineWidth != width { drawingLineWidth=width }
+    }
+    func prepareDrawingExport() {
+        guard !drawingSavePending else {return}
+        var next=drawing; next.ensureVertices()
+        if next != drawing { drawing=next }
+    }
+    func saveDrawingExportProfile(_ profile:DrawingExportProfile, document:String) {
+        guard canEditWork else { return }
+        guard drawingExportProfiles[document] != profile || drawingExportDocument != document else { return }
+        drawingExportProfiles[document]=profile; drawingExportDocument=document; saveWork()
+    }
+    func restoreDrawingAlignment() {
+        guard let a = drawingAlignment else { return }
+        restoreAlignment(a)
+    }
+    private func restoreAlignment(_ a: DrawingAlignmentSnapshot) {
+        guard !drawingSavePending else {return}
+        let canSave = workReady
+        workReady = false
+        if let restoredOrigin = a.origin {
+            guard setOriginAndResetPlanePan(restoredOrigin) else { workReady=canSave; return }
+        }
+        else { origin = nil; drawingVerticalDatum = nil; invalidateDisplayCaches() }
+        headingOffsetDegrees = a.heading; planePanEastMeters = a.east
+        planePanNorthMeters = a.north
+        committedVerticalDisplayOffsetMeters = a.committedHeight
+        displayPlaneOffsetMeters = a.height
+        renderedTransformSnapshot = nil
+        workReady = canSave
+        synchronizeDrawingVerticalDatum()
+        markAlignmentAdjusted()
+        saveWork()
+    }
+    func saveWork() {
+        // A line commit owns the pending queue slot until its acknowledgement.
+        // Later property changes are included by the normal save after resolve().
+        guard workReady,!drawingSavePending else {return}
+        enqueueWork(drawingState:drawing)
+    }
+    private func enqueueWork(drawingState:DrawingState,completion:((Result<Void,Error>)->Void)?=nil) {
+        saveSequence += 1
+        let sequence = saveSequence
+        let snapshot = SavedWork(drawing:drawingState,origin:origin,planeSystem:planeSystemNumber,heading:headingOffsetDegrees,east:planePanEastMeters,north:planePanNorthMeters,height:displayPlaneOffsetMeters,committedHeight:committedVerticalDisplayOffsetMeters,verticalDatum:drawingVerticalDatum,drawingLineWidth:drawingLineWidth,drawingPointReferenceWidth:drawingPointReferenceWidth,exportProfiles:drawingExportProfiles,exportDocument:drawingExportDocument,photoMode:photoCaptureMode,useARPhotoPose:useARPhotoPose,photoDocument:photoReferenceDocument,photoReferences:photoReferenceSettings)
+        workSaveMessage = "自動保存中"
+        workSaver.submit(sequence:sequence,snapshot:snapshot,libraryRevision:libraryRevision,layers:layers) { [weak self] acknowledged, result in
+            Task { @MainActor in
+                guard let self else {return}
+                if acknowledged == self.saveSequence {
+                    switch result {
+                    case .success: self.workSaveMessage = "自動保存済み"
+                    case .failure(let error): self.workSaveMessage = "保存失敗：作業を閉じず再試行してください（\(error.localizedDescription)）"
+                    }
+                }
+                completion?(result)
+            }
+        }
+    }
+    func retryWorkSave() {
+        if drawingLineSaveFailed {finishDrawing();return}
+        if workReady { saveWork() } else { restoreWork() }
+    }
+    private func saveImportedWork() {
+        guard workReady else { return }
+        libraryRevision += 1
+        saveWork()
+    }
+    private func restoreWork() {
+        guard !isRestoringWork else { return }
+        isRestoringWork = true
+        workSaveMessage = "前回作業を復元中"
+        workSaver.restore { [weak self] result in
+            Task { @MainActor in
+                guard let self else { return }
+                switch result {
+                case .success(let restored):
+                    if let restored {
+                        self.workRecoveredFromPreviousGeneration = restored.recovered
+                        let w = restored.snapshot
+                        self.layers = restored.layers; self.drawing = w.drawing; self.origin = w.origin
+                        self.planeSystemNumber = w.planeSystem; self.headingOffsetDegrees = w.heading
+                        self.planePanEastMeters = w.east; self.planePanNorthMeters = w.north
+                        self.displayPlaneOffsetMeters = w.height; self.committedVerticalDisplayOffsetMeters = w.committedHeight
+                        self.drawingVerticalDatum = w.verticalDatum
+                        self.photoCaptureMode=w.photoMode ?? .arOverlay
+                        self.useARPhotoPose=w.useARPhotoPose ?? true
+                        self.photoReferenceDocument=w.photoDocument
+                        self.photoReferenceSettings=w.photoReferences ?? [:]
+                        // Missing values belong to older work: retain its original default.
+                        let restoredPointReference=w.drawingPointReferenceWidth ?? 0.016
+                        self.drawingPointReferenceWidth = [0.008,0.016].contains(restoredPointReference) ? restoredPointReference : 0.016
+                        let restoredWidth=w.drawingLineWidth ?? 0.016
+                        self.drawingLineWidth=restoredWidth.isFinite ? max(0.004,min(0.08,restoredWidth)) : 0.016
+                        self.drawingExportProfiles=w.exportProfiles ?? [:]
+                        self.drawingExportDocument=w.exportDocument
+                        if w.drawingMetadataVersion == nil { self.drawing.ensureVertices(legacyDatum:w.verticalDatum) }
+                        self.rebuildVisibleData()
+                        if self.drawing.active { self.captureDrawingAlignment() }
+                        self.workNeedsRealignment = true
+                        self.workSaveMessage = restored.recovered ? "前の保存から復旧" : "前回作業を復元"
+                    } else { self.workSaveMessage = "" }
+                    self.workReady = true
+                case .failure:
+                    self.workReady = false
+                    self.workSaveMessage = "保存の復元失敗：既存保存を保護しています"
+                }
+                self.isRestoringWork = false
+                #if DEBUG
+                NSLog("ARWork restore completed; editable=%@", String(self.workReady))
+                #endif
+                self.synchronizeDrawingVerticalDatum()
+            }
+        }
+    }
+
+    /// Measurement heights are relative to a local display datum, never ellipsoid/GPS altitude.
+    /// Flat-display setting changes explicitly rebind the datum; measured 3D shape stays intact.
+    func synchronizeDrawingVerticalDatum() {
+        guard workReady,!drawingSavePending, let next = relativeAltitudeBaseline(), next.isFinite else { return }
+        guard drawingVerticalDatum != next else { return }
+        let canSave = workReady
+        workReady = false
+        if let old = drawingVerticalDatum {
+            var translation = matrix_identity_float4x4
+            translation.columns.3.y = Float(old-next)
+            drawing.rebase(translation)
+        }
+        drawingVerticalDatum = next
+        workReady = canSave
+        saveWork()
+    }
+
 
     @Published var layers: [ImportedDataLayer] = []
     @Published var features: [GeoFeature] = []
+    @Published private(set) var surveyOverlay: SurveyOverlay?
+    @Published private(set) var isPreparingMap = false
+    private var dataRevision = 0
+    private var dataCoordinateCount = 0
+    private var dataLineCount = 0
+    private var dataPointCount = 0
     @Published var importedPointList: [GeoCoordinate] = []
     @Published var origin: GeoCoordinate?
     @Published var selectedPoint: GeoCoordinate?
-    @Published var headingOffsetDegrees: Double = 0
+    @Published var headingOffsetDegrees: Double = 0 { didSet { if oldValue != headingOffsetDegrees { markAlignmentAdjusted() }; saveWork() } }
     /// 最後に中心を確定してからの一時的な高さ調整値。
     /// 実際の描画高さは `effectiveDisplayPlaneOffsetMeters` を使用する。
-    @Published var displayPlaneOffsetMeters: Double = AppModel.defaultDisplayPlaneOffsetMeters
-    @Published var planePanEastMeters: Double = 0
-    @Published var planePanNorthMeters: Double = 0
+    @Published var displayPlaneOffsetMeters: Double = AppModel.defaultDisplayPlaneOffsetMeters { didSet { if oldValue != displayPlaneOffsetMeters { markAlignmentAdjusted() }; saveWork() } }
+    @Published var planePanEastMeters: Double = 0 { didSet { if oldValue != planePanEastMeters { markAlignmentAdjusted() }; saveWork() } }
+    @Published var planePanNorthMeters: Double = 0 { didSet { if oldValue != planePanNorthMeters { markAlignmentAdjusted() }; saveWork() } }
     @Published var pillarsEnabled: Bool = false
     @Published var rastersEnabled: Bool = true
     @Published var distancesEnabled: Bool = false
-    @Published var lidarEnabled: Bool = false
-    @Published var lidarSupported: Bool = false
-    @Published var arCameraActive: Bool = true
+    @Published var lidarEnabled: Bool = false { didSet { UserDefaults.standard.set(lidarEnabled, forKey:"ARCoordinateViewer.LiDAREnabled"); if !lidarEnabled { reportLiDARDepth(false) } } }
+    @Published var lidarSupported: Bool = ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth)
+    @Published private(set) var lidarDepthAvailable = false
+    private var lastLiDARDepthTime: TimeInterval = 0
+    private var lidarFreshnessTask: Task<Void, Never>?
+    var lidarButtonTitle: String {
+        if !lidarSupported { return "LiDAR 非対応" }
+        if !lidarEnabled { return "LiDARオフ" }
+        if !arCameraActive { return "LiDAR ON・AR停止" }
+        return lidarDepthAvailable ? "LiDAR ON" : "LiDAR ON・深度待ち"
+    }
+    func reportLiDARDepth(_ available: Bool) {
+        let ready = available && lidarEnabled && lidarSupported && arCameraActive
+        if ready { lastLiDARDepthTime = ProcessInfo.processInfo.systemUptime }
+        if lidarDepthAvailable != ready { lidarDepthAvailable = ready }
+        guard ready, lidarFreshnessTask == nil else { return }
+        lidarFreshnessTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds:1_000_000_000)
+                guard let self else { return }
+                if !self.lidarEnabled || !self.arCameraActive || ProcessInfo.processInfo.systemUptime-self.lastLiDARDepthTime > 1 {
+                    self.reportLiDARDepth(false)
+                    self.lidarFreshnessTask = nil
+                    return
+                }
+            }
+        }
+    }
+    @Published var arCameraActive: Bool = true { didSet { if !arCameraActive {cancelPendingDrawingCapture();reportLiDARDepth(false)} } }
     @Published var screenLabels: [ScreenLabel] = []
     @Published private(set) var automaticHeadingCorrectionDegrees: Double = 0
     @Published var photoCaptureRequestID: Int = 0
+    @Published var photoCaptureMode:PhotoCaptureMode = .arOverlay { didSet { saveWork() } }
+    @Published var useARPhotoPose=true { didSet { saveWork() } }
+    @Published private(set) var activePhotoMode:PhotoCaptureMode = .arOverlay
+    @Published private(set) var activePhotoPositionSource:PhotoPositionSource = .ar
+    @Published private(set) var photoReferenceDocument:String?
+    @Published private(set) var photoReferenceSettings:[String:PhotoReferenceSettings]=[:]
+    private(set) var positionAlignmentRevision=0
+    private func markAlignmentAdjusted() { if workReady && !isRestoringWork { positionAlignmentRevision &+= 1 } }
+    func savePhotoReference(_ settings:PhotoReferenceSettings,document:String) {
+        guard canEditWork else { return }
+        guard photoReferenceDocument != document || photoReferenceSettings[document] != settings else { return }
+        photoReferenceDocument=document; photoReferenceSettings[document]=settings; saveWork()
+    }
+    var photoCoordinateContext:PhotoCoordinateContext {
+        let documents=drawingExportDocuments
+        let document=documents.first { $0.id==photoReferenceDocument } ?? (documents.count==1 ? documents.first : nil)
+        return PhotoCoordinateContext(origin:origin,verticalDatum:drawingCaptureDatum,documentID:document?.id,documentName:document?.name,reference:document?.reference,settings:document.flatMap { photoReferenceSettings[$0.id] } ?? PhotoReferenceSettings(),alignmentRevision:positionAlignmentRevision)
+    }
     @Published private(set) var photoCaptureState: PhotoCaptureState = .idle
     @Published private(set) var photoCaptureMessage: String?
     @Published var rasters: [GeoRaster] = []
@@ -75,6 +470,17 @@ final class AppModel: ObservableObject {
                 return
             }
             saveSettings()
+            if workReady {
+                if oldValue.useRelativeAltitude != settings.useRelativeAltitude {
+                    // Flat display has no known absolute height datum. Rebind explicitly,
+                    // preserving measured 3D shape rather than inventing geodetic elevations.
+                    drawingVerticalDatum = nil
+                    if !drawing.completed.isEmpty || !drawing.draft.points.isEmpty { workNeedsRealignment = true }
+                }
+                invalidateDisplayCaches()
+                synchronizeDrawingVerticalDatum()
+                saveWork()
+            }
         }
     }
 
@@ -91,7 +497,18 @@ final class AppModel: ObservableObject {
         if value <= -180.0 { value += 360.0 }
         return value
     }
-    private let maxRasterCount = 1
+    private var rasterRefreshScheduled = false
+    private func scheduleRasterRefresh() {
+        guard !rasterRefreshScheduled else { return }
+        rasterRefreshScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now()+0.1) { [weak self] in
+            guard let self else { return }
+            self.rasterRefreshScheduled = false
+            self.rasterTileRevision &+= 1
+        }
+    }
+    @Published private var rasterTileRevision = 0
+    private let maxRasterCount = 16
     private let settingsKey = "ARCoordinateViewer.DisplaySettings.v37"
     private struct ParsedImportResult {
         var name: String
@@ -105,8 +522,12 @@ final class AppModel: ObservableObject {
     }
     private var displayLimitCacheSignature: String = ""
     private var displayLimitCache: DisplayLimitResult?
+    @Published private var terrainRevision = 0
+    @Published private(set) var terrainNotice = ""
+    private var terrainCancellation = ImportCancellation()
     private var renderCacheSignature: String = ""
-    private var renderFeaturesCache: [RenderFeature] = []
+    private(set) var drawingSnapGeometryRevision=0
+    private var renderFeaturesCache: [RenderFeature] = [] {didSet {drawingSnapGeometryRevision &+= 1}}
     private var renderLabelsCache: [RenderLabel] = []
     private var selectedRenderPositionCache: SIMD3<Float>?
     private var altitudeCacheSignature: String = ""
@@ -136,6 +557,7 @@ final class AppModel: ObservableObject {
     private var altitudeGridOrigin: GeoCoordinate?
     private var altitudeGrid: [AltitudeGridKey: [Int]] = [:]
     private var altitudeBaselineCache: Double?
+    private var importCancellation = ImportCancellation()
     private var importOperationID = 0
     private var activePhotoCaptureRequestID: Int?
     private var hasPendingPhotoCaptureRequest = false
@@ -147,12 +569,38 @@ final class AppModel: ObservableObject {
     /// 地理座標のoriginは高度を持たないため、既存のDEM／相対標高とは分離して管理する。
     private var committedVerticalDisplayOffsetMeters: Double = 0
     
-    init() {
+    init(workStore: WorkPersistence = .live) {
+        self.workStore = workStore
+        let treeRoot = workStore.root.lastPathComponent == "ARWork"
+            ? workStore.root.deletingLastPathComponent().appendingPathComponent("TreeSurvey",isDirectory:true)
+            : workStore.root.appendingPathComponent("TreeSurvey-independent",isDirectory:true)
+        treeSurvey = TreeSurveyController(store:TreeSurveyStore(root:treeRoot))
+        let scanRoot = workStore.root.lastPathComponent == "ARWork" ? workStore.root.deletingLastPathComponent().appendingPathComponent("LiDARScanRecords",isDirectory:true) : workStore.root.appendingPathComponent("LiDARScanRecords-independent",isDirectory:true)
+        scanCapture=ScanCaptureController(root:scanRoot)
+        lidarEnabled = UserDefaults.standard.bool(forKey:"ARCoordinateViewer.LiDAREnabled")
+        if UserDefaults.standard.object(forKey:"ARCoordinateViewer.DrawingSnapEnabled") != nil {
+            drawingSnapEnabled=UserDefaults.standard.bool(forKey:"ARCoordinateViewer.DrawingSnapEnabled")
+        }
         settings = Self.loadSettings(key: settingsKey)
+        // 旧「制限なし」でも大容量表示の探索範囲は1kmだったため、実距離として明示する。
+        if settings.displayRadiusMeters <= 0 { settings.displayRadiusMeters = 1000 / settings.masterRangeScale }
+        restoreWork()
+        scanCapture.onChange = { [weak self] in DispatchQueue.main.async {self?.objectWillChange.send()} }
+        treeSurvey.onChange = { [weak self] in
+            // Never publish synchronously during updateUIView.
+            DispatchQueue.main.async { self?.objectWillChange.send() }
+        }
+    }
+
+    func startTreeSurvey() {
+        guard canEditWork,!scanModeActive,!drawing.active,!drawingSelectionMode else {drawingMessage="作図・選択を完了してから樹木調査を始めてください";return}
+        treeSurvey.start(origin:origin,datum:drawingCaptureDatum)
     }
 
     @discardableResult
     private func beginImportProgress(_ message: String) -> Int {
+        importCancellation.cancel()
+        importCancellation = ImportCancellation()
         importOperationID &+= 1
         isImporting = true
         importProgress = nil
@@ -191,6 +639,53 @@ final class AppModel: ObservableObject {
         importProgressMessage = ""
     }
 
+    func cancelImport() {
+        importCancellation.cancel()
+        importOperationID &+= 1
+        isImporting = false
+        importProgress = nil
+        statusMessage = "読み込みを中止しました"
+    }
+
+    func importDXF(url: URL, options: DXFImportOptions) {
+        let operationID = beginImportProgress("DXFを解析中：\(url.lastPathComponent)")
+        let cancellation = importCancellation
+        DispatchQueue.global(qos: .userInitiated).async {
+            let access = url.startAccessingSecurityScopedResource()
+            defer { if access { url.stopAccessingSecurityScopedResource() } }
+            do {
+                let parsed = try DXFParser.parse(url: url, options: options, progress: { progress in
+                    Task { @MainActor in self.updateImportProgress(progress, message: "DXFを解析中…", operationID: operationID) }
+                }, cancelled: { cancellation.isCancelled })
+                var sourceReference=options
+                sourceReference.insertionUnits=parsed.insertionUnits
+                let documentID=UUID()
+                let groups = Dictionary(grouping: parsed.features, by: { $0.sourceLayer ?? "0" })
+                let importedLayers = groups.keys.sorted().map { key in
+                    let features = groups[key]!
+                    return ImportedDataLayer(name: "\(url.lastPathComponent) / \(key)", features: features, points: features.filter { $0.kind == .point }.flatMap { $0.coordinates }, rasters: [], dxfReference:sourceReference,documentID:documentID)
+                }
+                Task { @MainActor in
+                    guard operationID == self.importOperationID else { return }
+                    self.planeSystemNumber = options.planeSystem
+                    // CAD標高を近隣から埋めず、元データを保持する。
+                    self.layers.append(contentsOf: importedLayers)
+                    self.rebuildVisibleData()
+                    self.statusMessage = "DXF読込：\(parsed.summary)"
+                    if !parsed.skipped.isEmpty { self.showImportNotice(self.statusMessage) }
+                    self.finishImportProgress(operationID: operationID)
+                }
+            } catch {
+                Task { @MainActor in
+                    guard operationID == self.importOperationID else { return }
+                    self.statusMessage = "DXF読込エラー：\(error.localizedDescription)"
+                    self.showImportNotice(self.statusMessage)
+                    self.finishImportProgress(operationID: operationID)
+                }
+            }
+        }
+    }
+
     func importFile(url: URL) {
         importFileAsync(url: url)
     }
@@ -201,6 +696,7 @@ final class AppModel: ObservableObject {
         let ext = url.pathExtension.lowercased()
         let targetRegion: DEMImportRegion?
         if ext == "xml" || ext == "zip" {
+            guard !isPreparingMap else { showImportNotice("地図の準備が完了してからDEMを追加してください。"); return }
             guard let region = currentDEMImportRegion() else {
                 let message = "DEMを読み込む前に、先に点・線などの対象データを読み込んでください。\n対象データの範囲に絞ってDEMを読み込みます。"
                 statusMessage = message
@@ -220,7 +716,7 @@ final class AppModel: ObservableObject {
             }
 
             do {
-                let data = try Data(contentsOf: url)
+                let data = try Data(contentsOf: url, options: .mappedIfSafe)
                 let result: ParsedImportResult
 
                 Task { @MainActor [weak self] in
@@ -343,11 +839,13 @@ final class AppModel: ObservableObject {
                 }
 
                 Task { @MainActor in
+                    guard operationID == self.importOperationID else { return }
                     self.applyParsedImport(result)
                     self.finishImportProgress(operationID: operationID)
                 }
             } catch {
                 Task { @MainActor in
+                    guard operationID == self.importOperationID else { return }
                     let message = "読込エラー：\(error.localizedDescription)"
                     self.statusMessage = message
                     self.showImportNotice(message)
@@ -421,7 +919,11 @@ final class AppModel: ObservableObject {
     /// 1m DEMタイルの端部にあるデータと、線の地形追従用サンプルを取りこぼさないよう、
     /// 外周へ100mの余裕を加える。
     private func currentDEMImportRegion() -> DEMImportRegion? {
-        let coordinates = features.flatMap { $0.coordinates } + importedPointList
+        let coordinates: [GeoCoordinate]
+        if let overlay = surveyOverlay, !overlay.boundingMapRect.isNull {
+            let r = overlay.boundingMapRect
+            coordinates = [MKMapPoint(x:r.minX,y:r.minY), MKMapPoint(x:r.maxX,y:r.maxY)].map { GeoCoordinate(latitude:$0.coordinate.latitude,longitude:$0.coordinate.longitude) }
+        } else { coordinates = Array(features.prefix(1000)).flatMap { $0.coordinates } + importedPointList }
         let validCoordinates = coordinates.filter {
             $0.latitude.isFinite && $0.longitude.isFinite
         }
@@ -452,7 +954,7 @@ final class AppModel: ObservableObject {
         let allCoordinates = features.flatMap { $0.coordinates } + points
         let validPairs: [(coord: GeoCoordinate, altitude: Double)] = allCoordinates.compactMap { coord in
             guard let altitude = validAltitudeValue(coord.altitude) else { return nil }
-            return (coord: coord, altitude: altitude.rounded())
+            return (coord: coord, altitude: altitude)
         }
 
         guard let gridOrigin = validPairs.first?.coord else {
@@ -472,7 +974,7 @@ final class AppModel: ObservableObject {
 
         func nearestAltitude(to coord: GeoCoordinate) -> Double {
             if let altitude = validAltitudeValue(coord.altitude) {
-                return altitude.rounded()
+                return altitude
             }
 
             let target = CoordinateConverter.enuMeters(from: coord, origin: gridOrigin)
@@ -504,12 +1006,13 @@ final class AppModel: ObservableObject {
 
             // 近傍に有効標高がない場合もAR表示中の再探索は行わない。
             // 概略表示なので、同一ファイル内の最初の有効標高をフォールバックにする。
-            return (bestAltitude ?? references.first?.altitude ?? 0).rounded()
+            return bestAltitude ?? references.first?.altitude ?? 0
         }
 
         func normalizedCoordinate(_ coord: GeoCoordinate) -> GeoCoordinate {
             var output = coord
             output.altitude = nearestAltitude(to: coord)
+            if output.altitude != coord.altitude { output.altitudeWasEstimated=true }
             return output
         }
 
@@ -518,7 +1021,7 @@ final class AppModel: ObservableObject {
                 name: feature.name,
                 kind: feature.kind,
                 coordinates: feature.coordinates.map(normalizedCoordinate),
-                labelRole: feature.labelRole
+                labelRole: feature.labelRole, sourceColor: feature.sourceColor
             )
         }
         let normalizedPoints = points.map(normalizedCoordinate)
@@ -555,6 +1058,7 @@ final class AppModel: ObservableObject {
     }
 
     private func rebuildVisibleData() {
+        saveImportedWork()
         let visible = layers.filter { $0.isVisible }
         features = visible.flatMap { $0.features }
         importedPointList = visible.flatMap { $0.points }
@@ -571,7 +1075,26 @@ final class AppModel: ObservableObject {
                 return $0.offset < $1.offset
             }
             .map { $0.element }
+        dataRevision &+= 1
+        let revision = dataRevision
+        let source = features, images = rasters
+        surveyOverlay = nil
+        isPreparingMap = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let overlay = SurveyOverlay(features: source, rasters: images)
+            let coordinates = source.reduce(0) { $0 + $1.coordinates.count }
+            let points = source.filter { $0.kind == .point }.reduce(0) { $0 + $1.coordinates.count }
+            let lines = source.filter { $0.kind != .point }.reduce(0) { $0 + max(0,$1.coordinates.count-1) + ($1.kind == .polygon ? 1 : 0) }
+            Task { @MainActor in
+                guard self.dataRevision == revision else { return }
+                self.dataCoordinateCount = coordinates; self.dataLineCount = lines; self.dataPointCount = points
+                self.surveyOverlay = overlay
+                self.isPreparingMap = false
+                self.invalidateDisplayCaches()
+            }
+        }
         invalidateDisplayCaches()
+        synchronizeDrawingVerticalDatum()
     }
 
     private func invalidateDisplayCaches() {
@@ -589,23 +1112,36 @@ final class AppModel: ObservableObject {
     }
 
     func setOriginFromLocation(_ location: CLLocation) {
-        setOriginAndResetPlanePan(
+        guard setOriginAndResetPlanePan(
             GeoCoordinate(
                 name: "iOS現在地",
                 latitude: location.coordinate.latitude,
                 longitude: location.coordinate.longitude,
                 altitude: nil
             )
-        )
+        ) else { return }
         statusMessage = "現在地を更新：\(location.coordinate.latitude.formatted(.number.precision(.fractionLength(7)))), \(location.coordinate.longitude.formatted(.number.precision(.fractionLength(7))))"
     }
 
     /// 現在位置をユーザー操作・GPSで明示的に更新した場合、
     /// 旧原点に対する位置合わせを新原点へ持ち越さない。
-    private func setOriginAndResetPlanePan(_ nextOrigin: GeoCoordinate) {
+    private func setOriginAndResetPlanePan(_ nextOrigin: GeoCoordinate) -> Bool {
+        guard !drawingSavePending else {statusMessage="線の保存完了を待ってください";return false}
+        let rebased:DrawingState
+        do { rebased = try origin.map { try DXFDrawingExport.rebase(drawing,from:$0,to:nextOrigin) } ?? drawing }
+        catch { statusMessage="立ち位置を変更できません：\(error.localizedDescription)"; return false }
+        let canSave = workReady
+        workReady = false
+        drawing=rebased
         origin = nextOrigin
         resetPlanePan()
         resetDisplayHeight()
+        workReady = canSave
+        invalidateDisplayCaches()
+        synchronizeDrawingVerticalDatum()
+        markAlignmentAdjusted()
+        saveWork()
+        return true
     }
 
     func resetPlanePan() {
@@ -631,15 +1167,15 @@ final class AppModel: ObservableObject {
         renderedTransformSnapshot = nil
     }
 
-    func setOrigin(latitude: Double, longitude: Double) {
-        setOriginAndResetPlanePan(GeoCoordinate(name: "手入力", latitude: latitude, longitude: longitude, altitude: nil))
+    func setOrigin(latitude: Double, longitude: Double, altitude:Double? = nil) {
+        guard setOriginAndResetPlanePan(GeoCoordinate(name: "手入力", latitude: latitude, longitude: longitude, altitude: altitude.flatMap { $0.isFinite ? $0 : nil })) else { return }
         statusMessage = "現在地を手入力で設定"
     }
 
-    func setOriginFromPlane(system: Int, x: Double, y: Double) {
+    func setOriginFromPlane(system: Int, x: Double, y: Double, altitude:Double? = nil) {
         do {
             let geo = try JapanesePlaneRectangularSystem.toGeodetic(system: system, x: x, y: y)
-            setOriginAndResetPlanePan(GeoCoordinate(name: "平面直角\(system)系", latitude: geo.latitude, longitude: geo.longitude, altitude: nil))
+            guard setOriginAndResetPlanePan(GeoCoordinate(name: "平面直角\(system)系", latitude: geo.latitude, longitude: geo.longitude, altitude: altitude.flatMap { $0.isFinite ? $0 : nil })) else { return }
             planeSystemNumber = system
             statusMessage = "現在地を平面直角座標で設定：\(system)系"
         } catch {
@@ -648,7 +1184,7 @@ final class AppModel: ObservableObject {
     }
 
     func setOriginFromPoint(_ point: GeoCoordinate) {
-        setOriginAndResetPlanePan(GeoCoordinate(name: point.name ?? "CSV選択点", latitude: point.latitude, longitude: point.longitude, altitude: nil))
+        guard setOriginAndResetPlanePan(GeoCoordinate(name: point.name ?? "CSV選択点", latitude: point.latitude, longitude: point.longitude, altitude: point.drawingSourceAltitude)) else { return }
         statusMessage = "現在地を選択点に設定：\(point.name ?? "名称なし")"
     }
 
@@ -721,6 +1257,7 @@ final class AppModel: ObservableObject {
     }
 
     func updateOriginToCurrentPanCenter() {
+        guard !drawing.active else { drawingMessage = "作図を完了してから中心を更新してください"; return }
         guard let origin else { return }
         let centerOffset = currentPanCenterOffsetMeters()
         let renderedRootHeight = renderedTransformSnapshot?.rootHeightMeters
@@ -736,13 +1273,20 @@ final class AppModel: ObservableObject {
         // 相対標高表示中に水平原点を変えると基準標高も変わる。
         // その差をroot高さへ足し、DEM上でも更新前後の世界Y座標を維持する。
         let oldAltitudeBaseline = hasHorizontalChange ? relativeAltitudeBaseline() : nil
+        var nextOrigin=origin
+        var rebased=drawing
         if hasHorizontalChange {
-            self.origin = CoordinateConverter.coordinate(
-                fromEast: centerOffset.east,
-                north: centerOffset.north,
-                origin: origin,
-                name: "中心更新"
-            )
+            do {
+                nextOrigin=try DXFDrawingExport.coordinate(east:centerOffset.east,north:centerOffset.north,origin:origin)
+                nextOrigin.name="中心更新"
+                nextOrigin.altitude=origin.drawingSourceAltitude
+                rebased=try DXFDrawingExport.rebase(drawing,from:origin,to:nextOrigin)
+            } catch { statusMessage="中心を更新できません：\(error.localizedDescription)";return }
+        }
+        let wasWorkReady = workReady
+        workReady = false
+        if hasHorizontalChange {
+            self.origin=nextOrigin
         }
         let newAltitudeBaseline = hasHorizontalChange ? relativeAltitudeBaseline() : nil
         let altitudeBaselineDelta: Double
@@ -752,10 +1296,18 @@ final class AppModel: ObservableObject {
             altitudeBaselineDelta = 0
         }
 
+        var drawingShift = matrix_identity_float4x4
+        drawingShift.columns.3.y = -Float(altitudeBaselineDelta)
+        rebased.rebase(drawingShift)
+        drawing=rebased
+        if let newAltitudeBaseline { drawingVerticalDatum = newAltitudeBaseline }
         let preservedRootHeight = renderedRootHeight + altitudeBaselineDelta
         committedVerticalDisplayOffsetMeters = preservedRootHeight - Self.defaultDisplayPlaneOffsetMeters
         displayPlaneOffsetMeters = Self.defaultDisplayPlaneOffsetMeters
         resetPlanePan()
+        workReady = wasWorkReady
+        markAlignmentAdjusted()
+        saveWork()
         if hasHorizontalChange && hasHeightChange {
             statusMessage = "現在の表示中心と高さを新しい基準に反映しました"
         } else if hasHeightChange {
@@ -816,7 +1368,7 @@ final class AppModel: ObservableObject {
     func photoCaptureDidStart(requestID: Int) {
         guard requestID == activePhotoCaptureRequestID,
               photoCaptureState == .capturing else { return }
-        photoCaptureMessage = "AR写真を撮影中…"
+        photoCaptureMessage = "\(activePhotoMode.title)を撮影中…"
         statusMessage = photoCaptureMessage ?? "AR写真を撮影中…"
         schedulePhotoCaptureTimeout(for: requestID, after: 12)
     }
@@ -872,8 +1424,10 @@ final class AppModel: ObservableObject {
             photoCaptureRequestID = 1
         }
         activePhotoCaptureRequestID = photoCaptureRequestID
+        activePhotoMode=photoCaptureMode
+        activePhotoPositionSource=useARPhotoPose ? .ar : .deviceGPS
         photoCaptureState = .capturing
-        photoCaptureMessage = "AR写真を準備中…"
+        photoCaptureMessage = "\(activePhotoMode.title)を準備中…"
         statusMessage = photoCaptureMessage ?? "AR写真を準備中…"
         // 初回は写真追加権限のOSダイアログが表示されることがあるため、
         // RealityKitが実際に撮影を始めるまでの待機には余裕を持たせる。
@@ -966,6 +1520,7 @@ final class AppModel: ObservableObject {
                     enableRasters: false
                 )
                 Task { @MainActor in
+                    guard operationID == self.importOperationID else { return }
                     self.applyParsedImport(result)
                     self.finishImportProgress(operationID: operationID)
                 }
@@ -983,11 +1538,14 @@ final class AppModel: ObservableObject {
     }
 
     func importGeoTIFFAsync(data: Data, fileName: String, coordinateMode: GeoTIFFCoordinateMode) {
-        let operationID = beginImportProgress("GeoTIFF読込中：\(fileName)")
+        let operationID = beginImportProgress("GeoTIFFタイルを準備中：\(fileName)")
+        let cancellation = importCancellation
 
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                let raster = try GeoTIFFParser.parse(data: data, fileName: fileName, coordinateMode: coordinateMode)
+                let raster = try GeoTIFFParser.parse(data: data, fileName: fileName, coordinateMode: coordinateMode, progress: { progress in
+                    Task { @MainActor in self.updateImportProgress(progress, message: "GeoTIFFタイルを準備中…", operationID: operationID) }
+                }, cancelled: { cancellation.isCancelled })
                 let planeSystem: Int?
                 if case .planeRectangular(let system) = coordinateMode {
                     planeSystem = system
@@ -1005,6 +1563,7 @@ final class AppModel: ObservableObject {
                     enableRasters: true
                 )
                 Task { @MainActor in
+                    guard operationID == self.importOperationID else { return }
                     self.applyParsedImport(result)
                     self.finishImportProgress(operationID: operationID)
                 }
@@ -1051,6 +1610,7 @@ final class AppModel: ObservableObject {
                     enableRasters: false
                 )
                 Task { @MainActor in
+                    guard operationID == self.importOperationID else { return }
                     self.applyParsedImport(result)
                     self.finishImportProgress(operationID: operationID)
                 }
@@ -1154,6 +1714,31 @@ final class AppModel: ObservableObject {
         let signature = makeRenderCacheSignature(limit: limit)
         guard signature != renderCacheSignature else { return }
 
+        if settings.boundaryTerrainFollowEnabled, settings.useRelativeAltitude, !elevationGrids.isEmpty, let origin {
+            terrainCancellation.cancel()
+            let cancellation = ImportCancellation(); terrainCancellation = cancellation
+            let grids = elevationGrids, heightLimit = settings.relativeAltitudeLimitMeters, radius = effectiveDisplayRadiusMeters
+            let limited = limit.features
+            let baseline = sampledDEMElevation(at: origin) ?? nearestBoundaryDEMElevation(to: origin)
+            renderCacheSignature = signature
+            renderFeaturesCache = []; renderLabelsCache = []; selectedRenderPositionCache = nil
+            DispatchQueue.main.async { [weak self] in self?.terrainNotice = "地形を計算中…" }
+            DispatchQueue.global(qos: .userInitiated).async {
+                let result = TerrainDraper.render(features: limited, origin: origin, grids: grids, baseline: baseline, heightLimit: heightLimit, radius: radius, cancelled: { cancellation.isCancelled })
+                Task { @MainActor in
+                    guard !cancellation.isCancelled, self.renderCacheSignature == signature else { return }
+                    self.renderFeaturesCache = result.features
+                    let selected = self.makeSelectedRenderPosition(altitudeBaseline: baseline)
+                    self.selectedRenderPositionCache = selected
+                    self.renderLabelsCache = self.makeRenderLabels(from: result.features, parcelLabelFeatures: [], selectedPosition: selected, altitudeBaseline: baseline)
+                    self.terrainNotice = result.deferredSegments > 0 ? "周辺を優先表示：範囲を狭めると残りの地形を表示できます" : (result.missingSamples > 0 ? "DEMの範囲外・欠損部分は非表示です" : "")
+                    self.terrainRevision &+= 1
+                }
+            }
+            return
+        }
+        terrainCancellation.cancel()
+        if !terrainNotice.isEmpty { DispatchQueue.main.async { [weak self] in self?.terrainNotice = "" } }
         // 標高差表示用の基準標高は1回だけ求め、点・線・ラベルで共通利用する。
         // 以前はRenderFeature生成とラベル生成の双方で計算経路に入っていたため、
         // 標高付きの大きなSIMA面データでは更新時の負荷が出やすかった。
@@ -1194,6 +1779,7 @@ final class AppModel: ObservableObject {
 
     private func makeSelectedRenderPosition(altitudeBaseline: Double?) -> SIMD3<Float>? {
         guard let origin, let selectedPoint else { return nil }
+        if settings.boundaryTerrainFollowEnabled, !elevationGrids.isEmpty, sampledDEMElevation(at: selectedPoint) == nil { return nil }
         let terrainElevation = settings.boundaryTerrainFollowEnabled
             ? sampledDEMElevation(at: selectedPoint)
             : nil
@@ -1293,7 +1879,7 @@ final class AppModel: ObservableObject {
 
     private func relativeHeightMeters(for coord: GeoCoordinate, baseline: Double?) -> Double {
         relativeHeightMeters(
-            elevation: coord.altitude,
+            elevation: (settings.boundaryTerrainFollowEnabled && !elevationGrids.isEmpty) ? nil : coord.altitude,
             baseline: baseline,
             allowsZero: false,
             preservesSubmeter: false
@@ -1316,12 +1902,8 @@ final class AppModel: ObservableObject {
             altitude = value
         }
 
-        // 従来の座標標高は概略表示の1m単位を維持する。
-        // DEMだけは地形の連続性を失わないよう0.1m単位で扱う。標高0mも有効値。
+        // ピックした点と標高基準の再計算が一致するよう、入力の小数精度を保つ。
         var height = altitude - baseline
-        height = preservesSubmeter
-            ? (height * 10).rounded() / 10
-            : height.rounded()
         if settings.relativeAltitudeLimitMeters > 0 {
             height = max(-settings.relativeAltitudeLimitMeters, min(settings.relativeAltitudeLimitMeters, height))
         }
@@ -1330,6 +1912,10 @@ final class AppModel: ObservableObject {
 
     private func relativeAltitudeBaseline() -> Double? {
         guard settings.useRelativeAltitude, let origin else { return nil }
+        if let height=origin.drawingSourceAltitude, height.isFinite { return height }
+        if settings.boundaryTerrainFollowEnabled, !elevationGrids.isEmpty {
+            return sampledDEMElevation(at: origin) ?? nearestBoundaryDEMElevation(to: origin)
+        }
         rebuildAltitudeCacheIfNeeded()
         if let cached = altitudeBaselineCache { return cached }
         if settings.boundaryTerrainFollowEnabled,
@@ -1345,7 +1931,7 @@ final class AppModel: ObservableObject {
         guard !altitudeReferenceCache.isEmpty else { return nil }
 
         let nearest = nearestAltitudeReference(to: origin)
-        altitudeBaselineCache = nearest?.altitude.rounded()
+        altitudeBaselineCache = nearest?.altitude
         return altitudeBaselineCache
     }
 
@@ -1358,6 +1944,15 @@ final class AppModel: ObservableObject {
 
     /// 表示中のDEMを解像度の細かい順に調べる。
     /// 標高0mは有効で、範囲外・欠測の場合だけ次のDEMへ進む。
+    func elevationDescription(at coordinate: GeoCoordinate) -> String {
+        if !elevationGrids.isEmpty {
+            if let value = sampledDEMElevation(at: coordinate) { return String(format: "標高 %.2fm（DEM）", value) }
+            return "標高不明（DEM範囲外・欠損）"
+        }
+        if let value = coordinate.altitude, value != 0 { return String(format: "CAD標高 %.2fm（DEM未読込）", value) }
+        return "標高未設定（DEM未読込）"
+    }
+
     private func sampledDEMElevation(at coordinate: GeoCoordinate) -> Double? {
         for grid in elevationGrids {
             if let elevation = grid.elevation(at: coordinate), elevation.isFinite {
@@ -1493,7 +2088,7 @@ final class AppModel: ObservableObject {
         let validPairs: [(coord: GeoCoordinate, altitude: Double)] = features.flatMap { feature in
             feature.coordinates.compactMap { coord in
                 guard let altitude = validAltitudeValue(coord.altitude) else { return nil }
-                return (coord: coord, altitude: altitude.rounded())
+                return (coord: coord, altitude: altitude)
             }
         }
 
@@ -1563,7 +2158,7 @@ final class AppModel: ObservableObject {
     }
 
     private func makeAltitudeCacheSignature() -> String {
-        let featureCoordinateCount = features.reduce(0) { $0 + $1.coordinates.count }
+        let featureCoordinateCount = dataCoordinateCount
         let firstFeatureID = features.first?.id.uuidString ?? "none"
         let lastFeatureID = features.last?.id.uuidString ?? "none"
         let originText: String
@@ -1577,235 +2172,71 @@ final class AppModel: ObservableObject {
     }
 
     private func makeRenderRasters() -> [RenderRaster] {
-        guard let origin, rastersEnabled else { return [] }
-        return rasters.prefix(maxRasterCount).map { raster in
-            let positions = raster.corners.map { coord in
-                return CoordinateConverter.localARPosition(
-                    from: coord,
-                    origin: origin,
-                    headingOffsetDegrees: 0,
-                    verticalOffsetMeters: 0
-                )
+        guard let origin, rastersEnabled, arCameraActive else { return [] }
+        var result: [RenderRaster] = []
+        for raster in rasters.prefix(maxRasterCount) {
+            guard let store = raster.tileStore else {
+                result.append(RenderRaster(id: raster.id, name: raster.name, image: raster.image, positions: raster.corners.map { CoordinateConverter.localARPosition(from: $0, origin: origin, headingOffsetDegrees: 0, verticalOffsetMeters: 0) }, notes: raster.notes))
+                continue
             }
-            return RenderRaster(id: raster.id, name: raster.name, image: raster.image, positions: positions, notes: raster.notes)
+            // 視点周辺は原寸、遠方は段階を下げる。階層を巡り、同じ場所を重ね描きしない。
+            func add(level: Int, tiles: [RasterTileStore.Tile]) {
+                for tile in tiles {
+                    let offsets = tile.corners.map { CoordinateConverter.enuMeters(from: $0, origin: origin) }
+                    let minE = offsets.map(\.east).min() ?? 0, maxE = offsets.map(\.east).max() ?? 0
+                    let minN = offsets.map(\.north).min() ?? 0, maxN = offsets.map(\.north).max() ?? 0
+                    let distance = hypot(max(0, max(minE, -maxE)), max(0, max(minN, -maxN)))
+                    let radius = effectiveDisplayRadiusMeters > 0 ? effectiveDisplayRadiusMeters : 1000
+                    guard distance <= radius else { continue }
+                    let width = max(maxE-minE, maxN-minN)
+                    let metersPerPixel = width / Double(max(tile.pixelWidth, tile.pixelHeight))
+                    let desired = max(0.02, max(distance, 1) / 1200)
+                    if level > 0 && metersPerPixel > desired && result.count < 24 {
+                        let tileBounds = SurveyOverlay.bounds(tile.corners)
+                        let children = store.tiles(level: level-1).filter { child in
+                            let c = child.corners
+                            let center = GeoCoordinate(latitude: (c[0].latitude+c[2].latitude)/2, longitude: (c[0].longitude+c[2].longitude)/2)
+                            return tileBounds.contains(MKMapPoint(CLLocationCoordinate2D(latitude: center.latitude, longitude: center.longitude)))
+                        }
+                        add(level: level-1, tiles: children)
+                        continue
+                    }
+                    let image = RasterTileImages.shared.image(tile.url, onReady: { [weak self] in self?.scheduleRasterRefresh() }) ?? store.preview(tile: tile, image: raster.image)
+                    guard let image else { continue }
+                    let positions = tile.corners.map { CoordinateConverter.localARPosition(from: $0, origin: origin, headingOffsetDegrees: 0, verticalOffsetMeters: 0) }
+                    result.append(RenderRaster(id: tile.id, name: raster.name, image: image, positions: positions, notes: "タイル"))
+                }
+            }
+            add(level: store.levels.count-1, tiles: store.tiles(level: store.levels.count-1))
         }
+        return result
     }
 
     private func makeRenderFeatures(from limited: [GeoFeature], altitudeBaseline: Double?) -> [RenderFeature] {
         guard let origin else { return [] }
-        let lineFeatures = limited.filter { $0.kind == .line || $0.kind == .polygon }
-        var terrainSpacingByID: [UUID: Double] = [:]
-        if settings.boundaryTerrainFollowEnabled, settings.useRelativeAltitude {
-            for feature in lineFeatures where feature.coordinates.count >= 2 {
-                let matchingGrids = elevationGridsIntersectingBoundary(feature.coordinates)
-                guard !matchingGrids.isEmpty else { continue }
-                let nativeSpacing = matchingGrids
-                    .map(\.estimatedCellSizeMeters)
-                    .filter { $0.isFinite && $0 > 0 }
-                    .min() ?? 1
-                terrainSpacingByID[feature.id] = max(
-                    settings.demSampleSpacingMeters,
-                    nativeSpacing
-                )
-            }
-        }
-        let maximumGeneratedSegments = max(5_000, lineFeatures.count)
-        var spacingMultiplier = 1.0
-
-        func generatedSegmentCount(multiplier: Double) -> Int {
-            var count = 0
-            for feature in lineFeatures {
-                if let baseSpacing = terrainSpacingByID[feature.id] {
-                    count += desiredBoundarySegmentCount(
-                        feature.coordinates,
-                        spacingMeters: baseSpacing * multiplier
-                    )
-                } else {
-                    count += max(1, feature.coordinates.count - 1)
-                }
-                if count > maximumGeneratedSegments { return count }
-            }
-            return count
-        }
-
-        if generatedSegmentCount(multiplier: spacingMultiplier) > maximumGeneratedSegments {
-            var lower = 1.0
-            var upper = 2.0
-            for _ in 0..<64 {
-                if generatedSegmentCount(multiplier: upper) <= maximumGeneratedSegments {
-                    break
-                }
-                lower = upper
-                upper *= 2
-            }
-            // 全線を同じ間隔で粗くするため、近い線だけが細かくなりすぎない。
-            for _ in 0..<24 {
-                let middle = (lower + upper) * 0.5
-                if generatedSegmentCount(multiplier: middle) > maximumGeneratedSegments {
-                    lower = middle
-                } else {
-                    upper = middle
-                }
-            }
-            spacingMultiplier = upper
-        }
-
+        // DEMを使う場合はTerrainDraperが担当。ここはDEMを使わない表示のみ。
         return limited.map { feature in
-            let terrainSpacing = terrainSpacingByID[feature.id].map {
-                $0 * spacingMultiplier
-            }
-            let shouldFollowTerrain = terrainSpacing != nil
-            // 境界線だけを細分化する処理とは別に、点は元の頂点位置のまま
-            // DEMを補間すればよい。従来はこの分岐が線にしか存在せず、
-            // 「高さ情報を使う」がONでも点だけ元データの高度に留まっていた。
-            let shouldSamplePointTerrain = feature.kind == .point
-                && settings.useRelativeAltitude
-                && settings.boundaryTerrainFollowEnabled
-
-            let coordinates: [GeoCoordinate]
-            if let terrainSpacing {
-                coordinates = densifiedBoundaryCoordinates(
-                    feature.coordinates,
-                    spacingMeters: terrainSpacing,
-                    maximumSegments: desiredBoundarySegmentCount(
-                        feature.coordinates,
-                        spacingMeters: terrainSpacing
-                    )
-                )
-            } else {
-                coordinates = feature.coordinates
-            }
-
-            let positions: [SIMD3<Float>] = coordinates.map { coord in
-                let verticalOffset: Double
-                if (shouldFollowTerrain || shouldSamplePointTerrain),
-                   let terrainElevation = sampledDEMElevation(at: coord) {
-                    verticalOffset = relativeHeightMeters(
-                        elevation: terrainElevation,
-                        baseline: altitudeBaseline,
-                        allowsZero: true,
-                        preservesSubmeter: true
-                    )
-                } else {
-                    verticalOffset = relativeHeightMeters(for: coord, baseline: altitudeBaseline)
-                }
-                return CoordinateConverter.localARPosition(
-                    from: coord,
-                    origin: origin,
-                    headingOffsetDegrees: 0,
-                    verticalOffsetMeters: verticalOffset
-                )
-            }
-            let pillarPositions: [SIMD3<Float>]?
-            if shouldFollowTerrain, let first = positions.first, let last = positions.last {
-                pillarPositions = [first, last]
-            } else {
-                pillarPositions = nil
-            }
-            return RenderFeature(
-                id: feature.id,
-                name: feature.name,
-                kind: feature.kind,
-                positions: positions,
-                labelRole: feature.labelRole,
-                pillarPositions: pillarPositions
-            )
+            RenderFeature(id: feature.id, name: feature.name, kind: feature.kind,
+                positions: feature.coordinates.map { coordinate in
+                    CoordinateConverter.localARPosition(from: coordinate, origin: origin, headingOffsetDegrees: 0,
+                        verticalOffsetMeters: relativeHeightMeters(for: coordinate, baseline: altitudeBaseline))
+                }, labelRole: feature.labelRole, sourceColor: feature.sourceColor, sourceAltitudes:feature.coordinates.map(\.drawingSourceAltitude))
         }
-    }
-
-    private func desiredBoundarySegmentCount(
-        _ coordinates: [GeoCoordinate],
-        spacingMeters: Double
-    ) -> Int {
-        guard coordinates.count >= 2 else { return 0 }
-        var count = 0
-        for index in 0..<(coordinates.count - 1) {
-            let offset = CoordinateConverter.enuMeters(
-                from: coordinates[index + 1],
-                origin: coordinates[index]
-            )
-            let segmentLength = hypot(offset.east, offset.north)
-            count += max(
-                1,
-                segmentLength.isFinite
-                    ? Int(ceil(segmentLength / max(1, spacingMeters)))
-                    : 1
-            )
-        }
-        return count
-    }
-
-    private func elevationGridsIntersectingBoundary(
-        _ coordinates: [GeoCoordinate]
-    ) -> [ElevationGrid] {
-        guard !coordinates.isEmpty else { return [] }
-        return elevationGrids.filter { grid in
-            if coordinates.contains(where: grid.contains) {
-                return true
-            }
-            guard coordinates.count >= 2 else { return false }
-            for index in 0..<(coordinates.count - 1) {
-                if segmentParameterRange(
-                    from: coordinates[index],
-                    to: coordinates[index + 1],
-                    intersecting: grid
-                ) != nil {
-                    return true
-                }
-            }
-            return false
-        }
-    }
-
-    private func densifiedBoundaryCoordinates(
-        _ coordinates: [GeoCoordinate],
-        spacingMeters: Double,
-        maximumSegments: Int
-    ) -> [GeoCoordinate] {
-        guard coordinates.count >= 2, maximumSegments > 0 else { return coordinates }
-        var output: [GeoCoordinate] = [coordinates[0]]
-        var remaining = maximumSegments
-
-        for index in 0..<(coordinates.count - 1) where remaining > 0 {
-            let a = coordinates[index]
-            let b = coordinates[index + 1]
-            let vector = CoordinateConverter.enuMeters(from: b, origin: a)
-            let length = hypot(vector.east, vector.north)
-            let segments = min(
-                remaining,
-                length.isFinite
-                    ? max(1, Int(ceil(length / max(1, spacingMeters))))
-                    : 1
-            )
-            for step in 1...segments {
-                let ratio = Double(step) / Double(segments)
-                var coordinate = CoordinateConverter.coordinate(
-                    fromEast: vector.east * ratio,
-                    north: vector.north * ratio,
-                    origin: a,
-                    name: step == segments ? b.name : nil
-                )
-                if let altitudeA = a.altitude,
-                   altitudeA.isFinite,
-                   let altitudeB = b.altitude,
-                   altitudeB.isFinite {
-                    coordinate.altitude = altitudeA + (altitudeB - altitudeA) * ratio
-                } else {
-                    coordinate.altitude = step == segments ? b.altitude : a.altitude
-                }
-                output.append(coordinate)
-            }
-            remaining -= segments
-        }
-        return output
     }
 
     private func makeLimitedFeatures() -> DisplayLimitResult {
-        let pointFeatures = features.filter { $0.kind == .point && settings.showPoints }
-        let lineFeatures = features.filter { ($0.kind == .line || $0.kind == .polygon) && settings.showLines }
-
-        let totalPointCount = pointFeatures.reduce(0) { $0 + $1.coordinates.count }
-        let totalLineCount = totalLineSegmentCount(in: lineFeatures)
+        let source: [GeoFeature]
+        if let surveyOverlay {
+            if let origin {
+                let center = MKMapPoint(CLLocationCoordinate2D(latitude: origin.latitude, longitude: origin.longitude))
+                let radius = (effectiveDisplayRadiusMeters > 0 ? effectiveDisplayRadiusMeters : 1000) * MKMapPointsPerMeterAtLatitude(origin.latitude)
+                source = surveyOverlay.query(MKMapRect(x: center.x-radius,y: center.y-radius,width: radius*2,height: radius*2), nearestTo: center, maximumFeatures: max(1000, (settings.maxDisplayPoints + settings.maxDisplayLines)*4))
+            } else { source = [] }
+        } else { source = features.count < 10000 ? features : [] }
+        let pointFeatures = source.filter { $0.kind == .point && settings.showPoints }
+        let lineFeatures = source.filter { ($0.kind == .line || $0.kind == .polygon) && settings.showLines }
+        let totalPointCount = settings.showPoints ? dataPointCount : 0
+        let totalLineCount = settings.showLines ? dataLineCount : 0
 
         let filteredPoints = filterByRadius(pointFeatures)
 
@@ -1888,7 +2319,7 @@ final class AppModel: ObservableObject {
         let altitudeValues = coords.compactMap { validAltitudeValue($0.altitude) }
         let altitude = altitudeValues.isEmpty ? nil : altitudeValues.reduce(0, +) / Double(altitudeValues.count)
         var geo = CoordinateConverter.coordinate(fromEast: labelPoint.x, north: labelPoint.y, origin: localOrigin, name: feature.name)
-        geo.altitude = altitude?.rounded()
+        geo.altitude = altitude
         return geo
     }
 
@@ -1963,11 +2394,11 @@ final class AppModel: ObservableObject {
             if coords.isEmpty { return nil }
             switch feature.kind {
             case .point:
-                return GeoFeature(name: feature.name, kind: feature.kind, coordinates: coords, labelRole: feature.labelRole)
+                return GeoFeature(name: feature.name, kind: feature.kind, coordinates: coords, labelRole: feature.labelRole, sourceColor: feature.sourceColor)
             case .line:
-                return coords.count >= 2 ? GeoFeature(name: feature.name, kind: feature.kind, coordinates: coords, labelRole: feature.labelRole) : nil
+                return coords.count >= 2 ? GeoFeature(name: feature.name, kind: feature.kind, coordinates: coords, labelRole: feature.labelRole, sourceColor: feature.sourceColor) : nil
             case .polygon:
-                return coords.count >= 3 ? GeoFeature(name: feature.name, kind: feature.kind, coordinates: coords, labelRole: feature.labelRole) : nil
+                return coords.count >= 3 ? GeoFeature(name: feature.name, kind: feature.kind, coordinates: coords, labelRole: feature.labelRole, sourceColor: feature.sourceColor) : nil
             }
         }
     }
@@ -1985,7 +2416,7 @@ final class AppModel: ObservableObject {
             } else {
                 let sorted = item.feature.coordinates.sorted { nearestDistanceMeters(for: [$0]) < nearestDistanceMeters(for: [$1]) }
                 let coords = Array(sorted.prefix(remaining))
-                output.append(GeoFeature(name: item.feature.name, kind: .point, coordinates: coords, labelRole: item.feature.labelRole))
+                output.append(GeoFeature(name: item.feature.name, kind: .point, coordinates: coords, labelRole: item.feature.labelRole, sourceColor: item.feature.sourceColor))
                 count += coords.count
                 remaining = 0
             }
@@ -2017,11 +2448,11 @@ final class AppModel: ObservableObject {
             guard coords.count >= 2 else { continue }
 
             for index in 0..<(coords.count - 1) {
-                appendLineSegment(name: feature.name, labelRole: feature.labelRole, a: coords[index], b: coords[index + 1], order: &order, into: &segments)
+                appendLineSegment(name: feature.name, labelRole: feature.labelRole, sourceColor: feature.sourceColor, a: coords[index], b: coords[index + 1], order: &order, into: &segments)
             }
 
             if feature.kind == .polygon, coords.count >= 3, let first = coords.first, let last = coords.last, !isSameCoordinate(first, last) {
-                appendLineSegment(name: feature.name, labelRole: feature.labelRole, a: last, b: first, order: &order, into: &segments)
+                appendLineSegment(name: feature.name, labelRole: feature.labelRole, sourceColor: feature.sourceColor, a: last, b: first, order: &order, into: &segments)
             }
         }
 
@@ -2036,24 +2467,27 @@ final class AppModel: ObservableObject {
         return (selected.map { $0.feature }, selected.count)
     }
 
-    private func appendLineSegment(name: String, labelRole: GeoFeatureLabelRole, a: GeoCoordinate, b: GeoCoordinate, order: inout Int, into segments: inout [(order: Int, feature: GeoFeature, nearest: Double)]) {
+    private func appendLineSegment(name: String, labelRole: GeoFeatureLabelRole, sourceColor: SourceColor?, a: GeoCoordinate, b: GeoCoordinate, order: inout Int, into segments: inout [(order: Int, feature: GeoFeature, nearest: Double)]) {
         defer { order += 1 }
 
         if effectiveDisplayRadiusMeters > 0, let origin {
             let da = CoordinateConverter.enuMeters(from: a, origin: origin)
             let db = CoordinateConverter.enuMeters(from: b, origin: origin)
-            let nearest = min(hypot(da.east, da.north), hypot(db.east, db.north))
+            let dx = db.east - da.east, dy = db.north - da.north
+            let denominator = dx * dx + dy * dy
+            let t = denominator > 0 ? max(0, min(1, -(da.east * dx + da.north * dy) / denominator)) : 0
+            let nearest = hypot(da.east + t * dx, da.north + t * dy)
             guard nearest <= effectiveDisplayRadiusMeters else { return }
-            let feature = GeoFeature(name: name, kind: .line, coordinates: [a, b], labelRole: labelRole)
+            let feature = GeoFeature(name: name, kind: .line, coordinates: [a, b], labelRole: labelRole, sourceColor: sourceColor)
             segments.append((order, feature, nearest))
         } else {
-            let feature = GeoFeature(name: name, kind: .line, coordinates: [a, b], labelRole: labelRole)
+            let feature = GeoFeature(name: name, kind: .line, coordinates: [a, b], labelRole: labelRole, sourceColor: sourceColor)
             segments.append((order, feature, nearestDistanceMeters(for: [a, b])))
         }
     }
 
     private func makeDisplayLimitCacheSignature() -> String {
-        let featureCoordinateCount = features.reduce(0) { $0 + $1.coordinates.count }
+        let featureCoordinateCount = dataCoordinateCount
         let firstFeatureID = features.first?.id.uuidString ?? "none"
         let lastFeatureID = features.last?.id.uuidString ?? "none"
         let originText: String
